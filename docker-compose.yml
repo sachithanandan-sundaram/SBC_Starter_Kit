@@ -59,4 +59,15 @@ networks:
   default:
     name: app-net
     driver: bridge
-    
+    # Pinned subnet/gateway so the docker bridge gateway IP (which backend/.env
+    # hardcodes as MEDIAMTX_HOST / VOYAGER_SDK_URL) doesn't change across host
+    # reboots. Docker otherwise picks the gateway dynamically, which breaks
+    # those hardcoded values after a reboot (observed 172.22.0.1 → 172.19.0.1 →
+    # 172.18.0.1 across boots). Verify 172.22.0.0/16 is free on the host before
+    # changing this (`docker network inspect <net>` for each existing network)
+    # — pick another private range here (and update backend/.env to match) if
+    # it collides with something else.
+    ipam:
+      config:
+        - subnet: 172.22.0.0/16
+          gateway: 172.22.0.1
