@@ -54,7 +54,8 @@ export function StreamProvider({ children }: { children: ReactNode }) {
   // This is the fix for "page refresh loses isStreaming while FFmpeg keeps
   // running on the backend".  We call both endpoints in parallel:
   //   /api/stream        → tells us whether any slot is active (count > 0)
-  //   /api/stream/status → gives us source_type / source_value for slot 1
+  //   /api/stream/status → gives us source_type / source_value for slot 1,
+  //                        plus `session` (active multi-camera grid info)
   // so the UI can reconstruct the full streaming view immediately.
   useEffect(() => {
     const restoreStreamState = async () => {
@@ -72,12 +73,26 @@ export function StreamProvider({ children }: { children: ReactNode }) {
         // Recover the source that slot 1 is currently using
         let sourceType: string | null = null;
         let sourceValue: string | null = null;
+        let multiCameraCount = 0;
         if (statusRes.ok) {
           const statusData = await statusRes.json();
           const slot1 = statusData.slots?.[1];
           if (slot1?.running) {
             sourceType = slot1.source_type ?? null;
             sourceValue = slot1.source_value ?? null;
+          }
+
+          // Multi-camera session (one model, N RTSP cameras) survives on the
+          // backend across a refresh but isn't reflected anywhere else the
+          // frontend polls — restore it here so the grid doesn't collapse
+          // back to the single-tile view.
+          const session = statusData.session;
+          if (session?.active && Array.isArray(session.inference_slots) && session.inference_slots.length > 1) {
+            multiCameraCount = session.inference_slots.length;
+            sourceType = session.source_type ?? sourceType;
+            if (Array.isArray(session.sources) && session.sources.length > 0) {
+              sourceValue = session.sources[0] ?? sourceValue;
+            }
           }
         }
 
@@ -88,6 +103,7 @@ export function StreamProvider({ children }: { children: ReactNode }) {
           // Prefer the live backend value; fall back to what localStorage had
           sourceType: (sourceType as StreamState["sourceType"]) ?? prev.sourceType,
           sourceValue: sourceValue ?? prev.sourceValue,
+          multiCameraCount,
         }));
       } catch (err) {
         // Non-fatal — user just won't see the live view automatically restored

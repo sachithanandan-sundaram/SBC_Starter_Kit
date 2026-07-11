@@ -78,6 +78,27 @@ async def _close_mediamtx_client() -> None:
 
 _slots: dict[int, SlotState] = {i: SlotState() for i in range(1, MAX_SLOTS + 1)}
 
+# Tracks the currently active multi-camera (one model, N RTSP sources) session
+# so /stream/status can report it and the frontend can rebuild the grid across
+# a page refresh — voyager-sdk inference sessions otherwise aren't reflected
+# anywhere in `_slots` (that dict only tracks the slot-1 ffmpeg→MediaMTX push).
+_multi_camera_session: dict = {
+    "active":          False,
+    "source_type":     None,
+    "sources":         [],
+    "inference_slots": [],
+    "raw_slot":        1,
+}
+
+
+def _clear_multi_camera_session() -> None:
+    _multi_camera_session.update({
+        "active":          False,
+        "source_type":     None,
+        "sources":         [],
+        "inference_slots": [],
+    })
+
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
@@ -267,6 +288,11 @@ async def _cleanup_inference_slots() -> None:
     
     This ensures a clean state when switching input types or stopping streams.
     """
+    # Any previously active multi-camera session is being torn down here
+    # (either replaced by a new stream or explicitly stopped) — clear it so
+    # /stream/status stops reporting a dead session.
+    _clear_multi_camera_session()
+
     # Stop all voyager inference sessions
     try:
         async with httpx.AsyncClient(timeout=5) as client:
@@ -413,6 +439,14 @@ async def _start_multi_camera_stream(sources: list[str]) -> dict:
     logger.info("Multi-camera stream started: %d source(s) → slots %s (model=%s)",
                 len(sources), slots, model.model_id)
 
+    _multi_camera_session.update({
+        "active":          True,
+        "source_type":     "RTSP",
+        "sources":         sources,
+        "inference_slots": slots,
+        "raw_slot":        1,
+    })
+
     return {
         "status":   "streaming",
         "mode":     "multi-camera",
@@ -490,15 +524,24 @@ async def upload_video(file: UploadFile = File(...)):
 
 @router.get("/stream/status")
 def stream_status():
-    return {
-        "slots": {
-            slot: {
-                "running":      state.running,
-                "source_type":  state.source_type,
-                "source_value": state.source_value,
-            }
-            for slot, state in _slots.items()
+    slots_out = {}
+    for slot, state in _slots.items():
+        if slot == 1:
+            running = state.running
+        else:
+            # Inference slots (2-5) aren't tracked in `_slots` — that dict only
+            # covers the slot-1 ffmpeg→MediaMTX push. Derive "running" the same
+            # way /stream already does: a live HLS playlist for the slot.
+            running = (INFERENCE_HLS / f"slot-{slot}" / "index.m3u8").exists()
+        slots_out[slot] = {
+            "running":      running,
+            "source_type":  state.source_type,
+            "source_value": state.source_value,
         }
+
+    return {
+        "slots":   slots_out,
+        "session": dict(_multi_camera_session),
     }
 
 
