@@ -1,0 +1,113 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Pytest cache
+.pytest_cache/
+
+# VS Code and IDEs
+.vscode/
+.idea/
+
+# Node.js
+node_modules/
+dist/
+build/
+
+# OS files
+.DS_Store
+
+# Docker-related
+docker-compose.override.yml
+
+# Ignore large binary caches
+*.log
+
+# Note: intentionally NOT ignoring any .env or env* files
+# per project instruction — keep env files tracked as needed.
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyw
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/build/
+
+# Environment — never commit real values
+backend/.env
+backend/.env.local
+backend/.env*.local
+frontend/.env.development
+frontend/.env.development.local
+frontend/.env.production
+frontend/.env.production.local
+
+# Data — persisted by Docker volumes, not git
+backend/data/recordings/*
+backend/data/events/*
+backend/data/hls/*
+backend/data/models/*
+!backend/data/models/.gitkeep
+!backend/data/recordings/.gitkeep
+!backend/data/events/.gitkeep
+!backend/data/hls/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.iws
+*.iml
+*.ipr
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Build/archive artifacts
+*.tar
+*.tar.gz
+*.zip
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+coverage.xml
+
+# Dependencies lock artifacts (keep lockfiles for reproducibility)
+# Uncomment if using different package managers
+# package-lock.json  # Keep for npm
+# yarn.lock         # Keep if using yarn

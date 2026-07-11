@@ -1,0 +1,62 @@
+services:
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: dashboard-frontend:latest
+    container_name: dashboard-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: dashboard-backend:latest
+    container_name: dashboard-backend
+    expose:
+      - "8000"
+    group_add:
+      - "44"
+    volumes:
+      - ./backend/data/models:/app/data/models
+      - ./backend/data/recordings:/app/data/recordings
+      - ./backend/data/events:/app/data/events
+      - ./backend/data/hls:/app/data/hls
+      - ./backend/data/uploads:/app/data/uploads
+      - /home/antelao/shared/hls:/tmp/hls                 # shared with voyager-sdk for inference HLS
+      - /:/host:rw                        # full host filesystem — allows user-specified save paths
+#       - /etc/localtime:/etc/localtime:ro  # inherit host timezone automatically
+#       - /etc/timezone:/etc/timezone:ro
+    env_file:
+      - ./backend/.env
+    # Uncomment to give the backend container direct access to a USB webcam
+    # for the ffmpeg → MediaMTX push (needed for "USB" source type). Works
+    # unchanged on both the Raspberry Pi 5 + M.2 kit and the Metis Compute
+    # Board (RK3588) — both enumerate USB cameras as /dev/videoN via V4L2.
+    # Run `curl http://localhost:8000/api/cameras` (or check `ls /dev/video*`
+    # on the host) to find the correct index(es) for your board first, since
+    # the RK3588's onboard ISP can register several additional /dev/videoN
+    # nodes that a Pi wouldn't have.
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # voyager-sdk — start separately via start_voyager.sh
+
+networks:
+  default:
+    name: app-net
+    driver: bridge
+    
