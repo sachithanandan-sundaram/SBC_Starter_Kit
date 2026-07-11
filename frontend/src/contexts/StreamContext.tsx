@@ -7,6 +7,10 @@ export interface StreamState {
   modelCount: number;
   showAnnotated: boolean;
   sessionToken: string; // unique token per stream session, force hls.js reload on new session
+  // Multi-camera, single-model mode: N cameras → slots 2..(1+N), same model
+  // on every tile. 0 when not in this mode (the usual single-camera /
+  // multi-model grid applies instead).
+  multiCameraCount: number;
 }
 
 interface StreamContextType {
@@ -35,12 +39,13 @@ export function StreamProvider({ children }: { children: ReactNode }) {
           modelCount: 0,
           showAnnotated: false,
           sessionToken: "",
+          multiCameraCount: 0,
         };
       }
     } catch (err) {
       console.error("Failed to load stream source from localStorage:", err);
     }
-    return { sourceType: null, sourceValue: null, isStreaming: false, modelCount: 0, showAnnotated: false, sessionToken: "" };
+    return { sourceType: null, sourceValue: null, isStreaming: false, modelCount: 0, showAnnotated: false, sessionToken: "", multiCameraCount: 0 };
   });
 
   const [previousModelCount, setPreviousModelCount] = useState(0);
@@ -161,7 +166,9 @@ export function StreamProvider({ children }: { children: ReactNode }) {
     setStreamState(typeof state === "function" ? state : state);
   };
 
-  const activeSlots = stream.isStreaming ? Math.min(4, Math.max(1, stream.modelCount + 1)) : 0;
+  const activeSlots = stream.isStreaming
+    ? Math.min(4, Math.max(1, Math.max(stream.modelCount, stream.multiCameraCount) + 1))
+    : 0;
 
   return (
     <StreamContext.Provider value={{ stream, setStream, activeSlots }}>

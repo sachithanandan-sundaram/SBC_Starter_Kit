@@ -90,9 +90,10 @@ class DeployRequest(BaseModel):
 
 class InferenceStartRequest(BaseModel):
     run_id: str
-    slot_id: int
+    slot_id: int                              # base slot; writer i → slot_id + i
     source_type: str
-    source: str
+    source: Optional[str] = None              # legacy single-camera field
+    sources: Optional[list[str]] = None        # NEW: multi-camera
     network: str
 
 
@@ -290,22 +291,40 @@ def inference_start(request: InferenceStartRequest):
         stop_session(request.run_id)
         time.sleep(0.5)
 
+    if request.sources:
+        # New multi-camera path: connect directly to each camera URL.
+        sources = request.sources
+    elif request.source:
+        # Legacy single-source path: voyager-sdk has always read from the
+        # MediaMTX relay here regardless of source_type/source (the original
+        # inference_worker didn't even accept a `source` arg) — this keeps
+        # per-model inference sessions decoupled from the raw input type
+        # (USB/file/RTSP are all normalized into MediaMTX upstream of this
+        # call). Preserve that behavior exactly for backward compatibility.
+        from ai_inference import RTSP_URL
+        sources = [RTSP_URL]
+    else:
+        raise HTTPException(400, "Either 'source' or 'sources' must be provided")
+
     try:
         start_session(
             run_id=request.run_id,
             source_type=request.source_type,
-            source=request.source,
+            sources=sources,
             network_yaml=request.network,
-            slot_id=request.slot_id,
+            base_slot=request.slot_id,
         )
     except Exception as e:
         raise HTTPException(400, str(e))
 
+    slots = list(range(request.slot_id, request.slot_id + len(sources)))
     return {
-        "status":  "started",
-        "run_id":  request.run_id,
-        "slot_id": request.slot_id,
-        "hls_url": f"/hls/slot-{request.slot_id}/index.m3u8",
+        "status":   "started",
+        "run_id":   request.run_id,
+        "slot_id":  request.slot_id,
+        "slots":    slots,
+        "hls_url":  f"/hls/slot-{request.slot_id}/index.m3u8",
+        "hls_urls": [f"/hls/slot-{s}/index.m3u8" for s in slots],
     }
 
 

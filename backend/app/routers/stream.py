@@ -44,6 +44,7 @@ INFERENCE_HLS   = Path("/tmp/hls")     # slots 2-5 inference output
 RECORDINGS_ROOT = Path("/app/data/recordings")
 UPLOADS_ROOT    = Path("/app/data/uploads")
 MAX_SLOTS       = 5
+MAX_MULTI_CAMERAS = MAX_SLOTS - 1      # slots 2..5 → up to 4 camera tiles
 
 
 # ── Slot state ────────────────────────────────────────────────────────────────
@@ -82,7 +83,8 @@ _slots: dict[int, SlotState] = {i: SlotState() for i in range(1, MAX_SLOTS + 1)}
 
 class StreamStartRequest(BaseModel):
     source_type: str
-    source_value: str
+    source_value: Optional[str] = None
+    sources: Optional[list[str]] = None   # NEW: multi-camera, one model on N RTSP sources
 
 
 class SlotStartRequest(BaseModel):
@@ -262,7 +264,7 @@ async def _cleanup_inference_slots() -> None:
     1. Stop all voyager-sdk inference sessions
     2. Clear HLS output directories
     3. Wait for cleanup to complete
-
+    
     This ensures a clean state when switching input types or stopping streams.
     """
     # Stop all voyager inference sessions
@@ -352,16 +354,89 @@ async def _trigger_inference_for_deployed_models(source_type: str, source: str) 
         logger.warning("Failed to trigger inference: %s", e)
 
 
+# ── Multi-camera, single-model ────────────────────────────────────────────────
+#
+# Design: slot → {source, model}, generalized so "different model per camera"
+# can be added later without a rewrite. For now, one deployed model runs
+# against N RTSP cameras (target 4) — one voyager-sdk process, demuxed by
+# fr.source_id, one HLSWriter per camera at slots 2..(1+N). RTSP cameras are
+# already H.264, so the inference path reads them directly — no MediaMTX
+# bounce needed for these slots (unlike the single-source path below).
+
+async def _start_multi_camera_stream(sources: list[str]) -> dict:
+    sources = [s.strip() for s in sources if s and s.strip()]
+    if not sources:
+        raise HTTPException(400, "At least one RTSP source is required")
+    if len(sources) > MAX_MULTI_CAMERAS:
+        raise HTTPException(400, f"At most {MAX_MULTI_CAMERAS} cameras supported")
+
+    state    = get_app_state()
+    deployed = [m for m in state.get_models() if getattr(m, "deployed", False)]
+    if not deployed:
+        raise HTTPException(400, "Deploy a model before starting a multi-camera stream")
+    model = deployed[0]
+
+    # Best-effort raw preview tile for camera 0 (slot 1). This must happen
+    # BEFORE the inference session is started below — it also clears any
+    # previous inference sessions/slots, which would kill our own session if
+    # done afterward.
+    try:
+        await _start_stream_to_mediamtx("RTSP", sources[0])
+        await _wait_for_mediamtx_hls(timeout=15.0)
+    except Exception as e:
+        logger.warning("Raw preview push failed (non-fatal): %s", e)
+
+    state.set_source("RTSP", sources[0])
+
+    base_slot = 2
+    run_id    = f"multicam-{model.model_id}"
+    network   = f"{settings.voyager_sdk_dir}/customers/{model.model_id}/{model.model_id}.yaml"
+
+    try:
+        async with httpx.AsyncClient(timeout=35) as client:
+            resp = await client.post(
+                f"{VOYAGER_BASE}/inference/start",
+                json={
+                    "run_id":      run_id,
+                    "slot_id":     base_slot,
+                    "source_type": "RTSP",
+                    "sources":     sources,
+                    "network":     network,
+                },
+            )
+    except httpx.RequestError as e:
+        raise HTTPException(503, f"voyager-sdk unreachable: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(502, f"voyager-sdk /inference/start error: {resp.text[:300]}")
+
+    slots = list(range(base_slot, base_slot + len(sources)))
+    logger.info("Multi-camera stream started: %d source(s) → slots %s (model=%s)",
+                len(sources), slots, model.model_id)
+
+    return {
+        "status":   "streaming",
+        "mode":     "multi-camera",
+        "slots":    slots,
+        "hls_urls": [f"/api/stream/slot/{s}/index.m3u8" for s in slots],
+    }
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/stream/start")
 async def start_stream(request: StreamStartRequest):
+    if request.source_type == "RTSP" and request.sources:
+        return await _start_multi_camera_stream(request.sources)
+
+    if not request.source_value:
+        raise HTTPException(400, "source_value is required")
+
     source = _resolve_source(request.source_type, request.source_value)
 
     app_state = get_app_state()
     app_state.set_source(request.source_type, source)
 
-    logger.info("Starting stream [type=%s source=%s]", request.source_type,
+    logger.info("Starting stream [type=%s source=%s]", request.source_type, 
                 source if request.source_type != "RTSP" else request.source_value)
 
     await _start_stream_to_mediamtx(request.source_type, source)

@@ -5,18 +5,21 @@ import { RtspInput } from "@/components/live/RtspInput";
 import { UsbSelector } from "@/components/live/UsbSelector";
 import { VideoFileInput } from "@/components/live/VideoFileInput";
 import { GridCell } from "@/components/live/GridCell";
-import { AlertCircle } from "lucide-react";
+import { AlertCircle, X } from "lucide-react";
 import { validateRtspUrl } from "@/lib/validation";
 
 type SourceType = "RTSP" | "USB" | "Video File";
 const SOURCES: SourceType[] = ["RTSP", "USB", "Video File"];
+const MAX_CAMERAS = 4;
 
 const LiveViewPage = () => {
   const { toast } = useToast();
   const { stream, setStream, activeSlots } = useStream();
   const [activeSource, setActiveSource] = useState<SourceType>("RTSP");
-  const [rtspUrl, setRtspUrl] = useState("");
-  const [isRtspUrlValid, setIsRtspUrlValid] = useState(false);
+  // RTSP tab: one or more camera URLs. A single URL uses the legacy
+  // single-camera / multi-model path; 2+ URLs trigger the new multi-camera,
+  // single-model path (one voyager-sdk session, N tiles, same model on all).
+  const [rtspUrls, setRtspUrls] = useState<string[]>([]);
   const [selectedUsb, setSelectedUsb] = useState<string | null>(null);
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [slotTitles, setSlotTitles] = useState<Record<number, string>>({ 1: "Raw Stream" });
@@ -24,22 +27,36 @@ const LiveViewPage = () => {
 
   useEffect(() => {
     if (!stream.sourceType || !stream.sourceValue) return;
-    if (stream.sourceType === "RTSP") { setRtspUrl(stream.sourceValue); setActiveSource("RTSP"); }
+    if (stream.sourceType === "RTSP") { setRtspUrls([stream.sourceValue]); setActiveSource("RTSP"); }
     else if (stream.sourceType === "USB") { setSelectedUsb(stream.sourceValue); setActiveSource("USB"); }
     else if (stream.sourceType === "Video File") { setSelectedFilePath(stream.sourceValue); setActiveSource("Video File"); }
   }, [stream.sourceType, stream.sourceValue]);
 
-  // Validate RTSP URL as user types
-  useEffect(() => {
-    if (activeSource === "RTSP") {
-      const validation = validateRtspUrl(rtspUrl);
-      setIsRtspUrlValid(validation.valid);
-    }
-  }, [rtspUrl, activeSource]);
-
   const handleSourceChange = (source: SourceType) => {
     setActiveSource(source);
     if (stream.isStreaming) handleStopStream();
+  };
+
+  const handleAddRtspUrl = (url: string) => {
+    const trimmed = url.trim();
+    if (!trimmed) return;
+    const validation = validateRtspUrl(trimmed);
+    if (!validation.valid) {
+      toast({ variant: "destructive", title: "Validation Error", description: validation.error || "Please enter a valid RTSP URL" });
+      return;
+    }
+    setRtspUrls((prev) => {
+      if (prev.includes(trimmed)) return prev;
+      if (prev.length >= MAX_CAMERAS) {
+        toast({ variant: "destructive", title: "Limit reached", description: `Maximum ${MAX_CAMERAS} cameras` });
+        return prev;
+      }
+      return [...prev, trimmed];
+    });
+  };
+
+  const handleRemoveRtspUrl = (url: string) => {
+    setRtspUrls((prev) => prev.filter((u) => u !== url));
   };
 
   const slotHlsUrl = (slot: number): string => {
@@ -50,25 +67,35 @@ const LiveViewPage = () => {
   const handleStartStream = async () => {
     let sourceType: SourceType | null = null;
     let sourceValue: string | null = null;
+    let body: Record<string, unknown>;
 
     if (activeSource === "RTSP") {
-      if (!rtspUrl || !isRtspUrlValid) { toast({ variant: "destructive", title: "Validation Error", description: "Please enter a valid RTSP URL" }); return; }
-      sourceType = "RTSP"; sourceValue = rtspUrl;
+      if (rtspUrls.length === 0) { toast({ variant: "destructive", title: "Validation Error", description: "Add at least one RTSP URL" }); return; }
+      sourceType = "RTSP";
+      if (rtspUrls.length > 1) {
+        body = { source_type: "RTSP", sources: rtspUrls };
+      } else {
+        sourceValue = rtspUrls[0];
+        body = { source_type: "RTSP", source_value: sourceValue };
+      }
     } else if (activeSource === "USB") {
       if (!selectedUsb) { toast({ variant: "destructive", title: "Validation Error", description: "Please select a USB camera" }); return; }
       sourceType = "USB"; sourceValue = selectedUsb;
-    } else if (activeSource === "Video File") {
+      body = { source_type: sourceType, source_value: sourceValue };
+    } else {
       if (!selectedFilePath) { toast({ variant: "destructive", title: "Validation Error", description: "Please select a video file" }); return; }
       sourceType = "Video File"; sourceValue = selectedFilePath;
+      body = { source_type: sourceType, source_value: sourceValue };
     }
 
-    if (!sourceType || !sourceValue) return;
+    if (!sourceType) return;
+    const multiCameraCount = sourceType === "RTSP" && rtspUrls.length > 1 ? rtspUrls.length : 0;
 
     try {
       const res = await fetch("/api/stream/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source_type: sourceType, source_value: sourceValue }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const error = await res.json();
@@ -80,10 +107,16 @@ const LiveViewPage = () => {
         isStreaming: true,
         modelCount: stream.modelCount,
         showAnnotated: stream.modelCount > 0,
+        multiCameraCount,
         sessionToken: (crypto.randomUUID ? crypto.randomUUID() : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => { const r = Math.random()*16|0; return (c==="x"?r:(r&0x3|0x8)).toString(16); })),
       });
       setInferenceReady({});
-      toast({ title: "Stream Started", description: `Connected to ${sourceType}` });
+      toast({
+        title: "Stream Started",
+        description: multiCameraCount > 0
+          ? `${multiCameraCount} cameras running the same model`
+          : `Connected to ${sourceType}`,
+      });
     } catch (err) {
       toast({ variant: "destructive", title: "Stream Error", description: err instanceof Error ? err.message : "Failed to start stream" });
     }
@@ -96,8 +129,9 @@ const LiveViewPage = () => {
         const error = await res.json();
         throw new Error(error.detail || "Failed to stop stream");
       }
-      setStream({ sourceType: null, sourceValue: null, isStreaming: false, modelCount: stream.modelCount, showAnnotated: false, sessionToken: "" });
+      setStream({ sourceType: null, sourceValue: null, isStreaming: false, modelCount: stream.modelCount, showAnnotated: false, multiCameraCount: 0, sessionToken: "" });
       setInferenceReady({});
+      setRtspUrls([]);
       toast({ title: "Stream Stopped" });
     } catch (err) {
       toast({ variant: "destructive", title: "Error", description: err instanceof Error ? err.message : "Failed to stop stream" });
@@ -127,8 +161,9 @@ const LiveViewPage = () => {
 
       // Just check playlist returns 200 and contains at least one .ts line —
       // no HEAD probe (FastAPI FileResponse only allows GET, HEAD returns 405 via nginx)
-      if (stream.modelCount > 0) {
-        for (let s = 2; s <= Math.min(stream.modelCount, 4) + 1; s++) {
+      const tileCount = stream.multiCameraCount > 0 ? stream.multiCameraCount : stream.modelCount;
+      if (tileCount > 0) {
+        for (let s = 2; s <= Math.min(tileCount, 4) + 1; s++) {
           try {
             const r = await fetch(`/api/stream/slot/${s}/index.m3u8`);
             if (!r.ok) {
@@ -152,11 +187,19 @@ const LiveViewPage = () => {
     load();
     const interval = setInterval(load, 3000);
     return () => clearInterval(interval);
-  }, [stream.isStreaming, stream.modelCount]);
+  }, [stream.isStreaming, stream.modelCount, stream.multiCameraCount]);
 
-  const inferenceSlots = stream.modelCount > 0
-    ? Array.from({ length: Math.min(4, stream.modelCount) }, (_, i) => i + 2)
-    : [];
+  const isMultiCamera = stream.multiCameraCount > 0;
+  const inferenceSlots = isMultiCamera
+    ? Array.from({ length: Math.min(4, stream.multiCameraCount) }, (_, i) => i + 2)
+    : stream.modelCount > 0
+      ? Array.from({ length: Math.min(4, stream.modelCount) }, (_, i) => i + 2)
+      : [];
+
+  const tileTitle = (slot: number): string => {
+    if (isMultiCamera) return `Camera ${slot - 1}`;
+    return slotTitles[slot] || `Model ${slot - 1}`;
+  };
 
   return (
     <div className="flex flex-col space-y-6">
@@ -179,7 +222,31 @@ const LiveViewPage = () => {
           </div>
 
           <div className="w-full max-w-4xl rounded-lg border border-border bg-card p-4">
-            {activeSource === "RTSP" && <RtspInput onConnect={(url) => setRtspUrl(url)} />}
+            {activeSource === "RTSP" && (
+              <div className="space-y-4">
+                <RtspInput onConnect={handleAddRtspUrl} />
+                <div className="space-y-1.5">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    Cameras ({rtspUrls.length}/{MAX_CAMERAS}) — add 2+ to run one model across a 2×2 grid
+                  </p>
+                  {rtspUrls.length > 0 && (
+                    <div className="flex flex-col gap-0.5 rounded-md border border-border bg-muted/30 p-1">
+                      {rtspUrls.map((url) => (
+                        <div key={url} className="group flex items-center justify-between rounded px-2 py-1.5 hover:bg-muted">
+                          <span className="flex-1 truncate font-mono text-xs text-foreground">{url}</span>
+                          <button
+                            onClick={() => handleRemoveRtspUrl(url)}
+                            className="ml-2 shrink-0 text-muted-foreground hover:text-destructive"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
             {activeSource === "USB" && <UsbSelector onSelect={(deviceId) => setSelectedUsb(deviceId)} />}
             {activeSource === "Video File" && <VideoFileInput onSelect={(filePath) => setSelectedFilePath(filePath)} />}
           </div>
@@ -187,7 +254,7 @@ const LiveViewPage = () => {
           <button
             onClick={handleStartStream}
             disabled={
-              (activeSource === "RTSP" && !isRtspUrlValid) ||
+              (activeSource === "RTSP" && rtspUrls.length === 0) ||
               (activeSource === "USB" && !selectedUsb) ||
               (activeSource === "Video File" && !selectedFilePath)
             }
@@ -198,11 +265,13 @@ const LiveViewPage = () => {
         </div>
       ) : (
         <>
-          {stream.modelCount > 0 && (
+          {(stream.modelCount > 0 || isMultiCamera) && (
             <div className="flex items-start gap-3 rounded-lg border border-blue-200/50 bg-blue-50/50 p-3">
               <AlertCircle className="h-5 w-5 shrink-0 text-blue-600 mt-0.5" />
               <p className="text-sm font-medium text-blue-900">
-                {stream.modelCount} model{stream.modelCount !== 1 ? "s" : ""} running inference • tile 1 is raw stream
+                {isMultiCamera
+                  ? `${stream.multiCameraCount} cameras running the same model • tile 1 is raw stream`
+                  : `${stream.modelCount} model${stream.modelCount !== 1 ? "s" : ""} running inference • tile 1 is raw stream`}
               </p>
             </div>
           )}
@@ -234,7 +303,7 @@ const LiveViewPage = () => {
             {inferenceSlots.length > 0 && (
               <div className="space-y-2">
                 <div className="inline-flex items-center rounded-md bg-muted px-3 py-1 text-xs font-semibold text-muted-foreground">
-                  Model Inference Streams
+                  {isMultiCamera ? "Camera Inference Grid" : "Model Inference Streams"}
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   {inferenceSlots.map((slot) => (
@@ -247,13 +316,13 @@ const LiveViewPage = () => {
                         <GridCell
                           cellNumber={slot as 2 | 3 | 4}
                           src={slotHlsUrl(slot)}
-                          title={slotTitles[slot] || `Model ${slot - 1}`}
+                          title={tileTitle(slot)}
                         />
                       ) : (
                         <div className="flex h-full flex-col items-center justify-center gap-3 bg-muted/30 text-muted-foreground">
                           <div className="h-7 w-7 animate-spin rounded-full border-2 border-primary border-t-transparent" />
                           <div className="text-center">
-                            <p className="text-sm font-medium">{slotTitles[slot] || `Model ${slot - 1}`}</p>
+                            <p className="text-sm font-medium">{tileTitle(slot)}</p>
                             <p className="text-xs mt-0.5">Waiting for inference stream...</p>
                           </div>
                         </div>

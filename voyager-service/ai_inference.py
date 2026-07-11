@@ -277,17 +277,23 @@ class HLSWriter:
 
 # ── Inference worker ──────────────────────────────────────────────────────────
 
-def inference_worker(run_id: str, network_yaml: str, slot_id: int,
-                     frame_queue: Queue, stop_event):
+def inference_worker(run_id: str, network_yaml: str, sources: list,
+                     base_slot: int, frame_queues: list, stop_event):
     """
-    Reads from MediaMTX RTSP stream via wginference.init.
-    Proven working at 17.5fps on RPi5.
-    No frame buffer, no directory source, no GStreamer init issues.
+    Single wginference process reading N sources at once (Axelera's own
+    inference.py pattern — one create_inference_stream call, multiple
+    positional source URLs). Each frame carries fr.source_id, 0-based and
+    index-aligned to the order `sources` were passed; route it to
+    frame_queues[fr.source_id] which feeds HLSWriter(base_slot + source_id).
+
+    NEVER add --frame-rate here — on this board's mppvideodec it aborts the
+    process with "inplace_addstreamid: meta_key already exists".
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
-    logger.info("[%s] inference worker starting (slot=%d)", run_id, slot_id)
+    logger.info("[%s] inference worker starting (base_slot=%d, sources=%d)",
+                run_id, base_slot, len(sources))
 
     try:
         import wginference
@@ -298,8 +304,9 @@ def inference_worker(run_id: str, network_yaml: str, slot_id: int,
         wginference.set_class_map(class_map)
         logger.info("[%s] class map set: %s", run_id, class_map)
 
-        parser       = config.create_inference_argparser(yaml_parser.get_network_yaml_info())
-        total_frames = 0
+        parser         = config.create_inference_argparser(yaml_parser.get_network_yaml_info())
+        total_frames   = 0
+        logged_sources = 0  # bring-up aid: log fr.source_id for the first ~20 frames
 
         # GStreamer handle for teardown between stream restarts. Axelera's own
         # inference.py calls stream.stop() + Gst.deinit() in a finally block on
@@ -316,26 +323,16 @@ def inference_worker(run_id: str, network_yaml: str, slot_id: int,
         while not stop_event.is_set():
             stream = None
             try:
-                logger.info("[%s] connecting to %s", run_id, RTSP_URL)
+                logger.info("[%s] connecting to %d source(s): %s", run_id, len(sources), sources)
                 args    = parser.parse_args([
                     network_yaml,
-                    RTSP_URL,
+                    *sources,
                     "--no-display",
                     "--rtsp-latency", "0",
                 ])
                 tracers = inf_tracers.create_tracers_from_args(args)
                 stream  = wginference.init(args, tracers)
                 logger.info("[%s] stream initialized", run_id)
-                # Track wginference child pids so we only kill OUR process on stop
-                _my_wginference_pids = set()
-                try:
-                    import psutil
-                    me = psutil.Process(os.getpid())
-                    for c in me.children(recursive=True):
-                        if "wginference" in " ".join(c.cmdline()):
-                            _my_wginference_pids.add(c.pid)
-                except Exception:
-                    pass
 
                 for fr in stream:
                     if stop_event.is_set():
@@ -343,11 +340,18 @@ def inference_worker(run_id: str, network_yaml: str, slot_id: int,
                     if fr is None or fr.image is None:
                         continue
 
+                    sid = getattr(fr, "source_id", 0) or 0
+                    if logged_sources < 20:
+                        logger.info("[%s] frame source_id=%s", run_id, sid)
+                        logged_sources += 1
+                    if sid >= len(frame_queues):
+                        continue
+
                     frame = fr.image.asarray('BGR').copy()
                     frame, _, _ = wginference.draw_overlays_bgr(frame, fr.meta)
                     jpeg = encode_jpeg(frame)
                     if jpeg:
-                        push_frame(frame_queue, jpeg)
+                        push_frame(frame_queues[sid], jpeg)
 
                     total_frames += 1
                     if total_frames % 200 == 0:
@@ -396,20 +400,31 @@ def inference_worker(run_id: str, network_yaml: str, slot_id: int,
 
 # ── Session management ────────────────────────────────────────────────────────
 
-def start_session(run_id: str, source_type: str, source: str,
-                  network_yaml: str, slot_id: int) -> bool:
+def start_session(run_id: str, source_type: str, sources, network_yaml: str,
+                  base_slot: int) -> bool:
+    """
+    One wginference process for ALL of `sources`, one HLSWriter per source at
+    slots base_slot .. base_slot + len(sources) - 1. `sources` may be a single
+    string (legacy single-camera call) or a list (multi-camera).
+    """
     if run_id in SESSIONS:
         raise Exception(f"Session {run_id} already exists")
+
+    if isinstance(sources, str):
+        sources = [sources]
+    sources = list(sources)
+    if not sources:
+        raise Exception("At least one source is required")
 
     with _active_sessions.get_lock():
         _active_sessions.value += 1
 
-    frame_queue = Queue(maxsize=30)
-    stop_event  = Event()
+    frame_queues = [Queue(maxsize=30) for _ in sources]
+    stop_event   = Event()
 
     process = Process(
         target=inference_worker,
-        args=(run_id, network_yaml, slot_id, frame_queue, stop_event),
+        args=(run_id, network_yaml, sources, base_slot, frame_queues, stop_event),
         daemon=False,
     )
     process.start()
@@ -424,17 +439,20 @@ def start_session(run_id: str, source_type: str, source: str,
         except OSError:
             time.sleep(0.05)
 
-    hls = HLSWriter(run_id, slot_id, frame_queue)
-    hls.start()
+    writers = []
+    for i in range(len(sources)):
+        w = HLSWriter(f"{run_id}-s{i}", base_slot + i, frame_queues[i])
+        w.start()
+        writers.append(w)
 
     SESSIONS[run_id] = {
         "process":     process,
         "pgid":        pgid,
-        "hls":         hls,
+        "writers":     writers,
         "stop_event":  stop_event,
-        "slot_id":     slot_id,
+        "base_slot":   base_slot,
         "source_type": source_type,
-        "source":      source,
+        "sources":     sources,
         "network":     network_yaml,
     }
 
@@ -452,7 +470,7 @@ def start_session(run_id: str, source_type: str, source: str,
                 try:
                     new_proc = Process(
                         target=inference_worker,
-                        args=(run_id, network_yaml, slot_id, frame_queue, stop_event),
+                        args=(run_id, network_yaml, sources, base_slot, frame_queues, stop_event),
                         daemon=False,
                     )
                     new_proc.start()
@@ -475,7 +493,8 @@ def start_session(run_id: str, source_type: str, source: str,
 
     threading.Thread(target=_watchdog, daemon=True, name=f"watchdog-{run_id}").start()
 
-    logger.info("[%s] session started (pid=%d, slot=%d)", run_id, process.pid, slot_id)
+    logger.info("[%s] session started (pid=%d, slots=%d..%d)",
+                run_id, process.pid, base_slot, base_slot + len(sources) - 1)
     return True
 
 
@@ -523,9 +542,8 @@ def stop_session(run_id: str) -> bool:
     # Give AIPU driver time to release cores
     time.sleep(3)
 
-    hls = session.get("hls")
-    if hls:
-        hls.stop()
+    for w in session.get("writers", []):
+        w.stop()
 
     logger.info("[%s] session stopped", run_id)
     return True
@@ -534,14 +552,15 @@ def stop_session(run_id: str) -> bool:
 def get_status() -> list:
     return [
         {
-            "run_id":   rid,
-            "slot_id":  s["slot_id"],
-            "pid":      s["process"].pid,
-            "alive":    s["process"].is_alive(),
-            "exitcode": s["process"].exitcode,
-            "playlist": s["hls"].playlist,
-            "source":   s["source"],
-            "network":  s["network"],
+            "run_id":    rid,
+            "base_slot": s["base_slot"],
+            "slots":     [w.slot_id for w in s["writers"]],
+            "pid":       s["process"].pid,
+            "alive":     s["process"].is_alive(),
+            "exitcode":  s["process"].exitcode,
+            "playlists": [w.playlist for w in s["writers"]],
+            "sources":   s["sources"],
+            "network":   s["network"],
         }
         for rid, s in SESSIONS.items()
     ]
