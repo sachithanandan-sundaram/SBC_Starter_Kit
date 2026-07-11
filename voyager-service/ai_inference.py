@@ -308,18 +308,6 @@ def inference_worker(run_id: str, network_yaml: str, sources: list,
         total_frames   = 0
         logged_sources = 0  # bring-up aid: log fr.source_id for the first ~20 frames
 
-        # GStreamer handle for teardown between stream restarts. Axelera's own
-        # inference.py calls stream.stop() + Gst.deinit() in a finally block on
-        # every exit; without this the previous pipeline's stream-id stays
-        # registered and the next init aborts with
-        # "inplace_addstreamid: meta_key already exists".
-        try:
-            import gi
-            gi.require_version("Gst", "1.0")
-            from gi.repository import Gst
-        except Exception:
-            Gst = None
-
         while not stop_event.is_set():
             stream = None
             try:
@@ -379,19 +367,18 @@ def inference_worker(run_id: str, network_yaml: str, sources: list,
                             break
                         time.sleep(0.5)
             finally:
-                # Release the stream and fully tear down GStreamer so the next
-                # init starts clean (mirrors inference.py's finally block).
+                # Per-pipeline teardown only. Do NOT call Gst.deinit() here — it
+                # globally de-inits GStreamer for the whole process and must
+                # happen at most once, at final exit. Calling it between
+                # retries kills rtspsrc/axinplace/etc. and the next init aborts
+                # with "GStreamer should not be deinitialized a second time."
+                # (The retry loop is hit immediately with multiple sources
+                # when any one of them fails to connect.)
                 if stream is not None:
                     try:
                         stream.stop()
                     except Exception as te:
                         logger.debug("[%s] stream.stop() failed: %s", run_id, te)
-                if Gst is not None:
-                    try:
-                        if Gst.is_initialized():
-                            Gst.deinit()
-                    except Exception as ge:
-                        logger.debug("[%s] Gst.deinit() failed: %s", run_id, ge)
 
     except Exception:
         logger.exception("[%s] inference worker crashed", run_id)
