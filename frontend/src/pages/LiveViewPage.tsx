@@ -24,6 +24,11 @@ const LiveViewPage = () => {
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [slotTitles, setSlotTitles] = useState<Record<number, string>>({ 1: "Raw Stream" });
   const [inferenceReady, setInferenceReady] = useState<Record<number, boolean>>({});
+  // Per-camera reachability in multi-camera mode (index-aligned to cameras
+  // 0..N-1) — a dead source is excluded from the inference session rather
+  // than taking the others down with it; this reflects that on the tile
+  // instead of leaving it spinning on "waiting for stream" forever.
+  const [sourceStatus, setSourceStatus] = useState<boolean[]>([]);
 
   useEffect(() => {
     if (!stream.sourceType || !stream.sourceValue) return;
@@ -157,6 +162,7 @@ const LiveViewPage = () => {
     if (!stream.isStreaming) {
       setSlotTitles({ 1: "Raw Stream" });
       setInferenceReady({});
+      setSourceStatus([]);
       return;
     }
 
@@ -173,6 +179,18 @@ const LiveViewPage = () => {
           setSlotTitles(next);
         }
       } catch { /* noop */ }
+
+      // Per-camera reachability (multi-camera mode only)
+      if (stream.multiCameraCount > 0) {
+        try {
+          const res = await fetch("/api/stream/status");
+          if (res.ok) {
+            const data = await res.json();
+            const status = data.session?.source_status;
+            if (Array.isArray(status)) setSourceStatus(status.map(Boolean));
+          }
+        } catch { /* noop */ }
+      }
 
       // Just check playlist returns 200 and contains at least one .ts line —
       // no HEAD probe (FastAPI FileResponse only allows GET, HEAD returns 405 via nginx)
@@ -221,15 +239,27 @@ const LiveViewPage = () => {
   // Shared tile renderer for both the raw and inference grids in multi-camera
   // mode — same readiness gating (both hubs for a camera come online
   // together, part of the same session), same placeholder while waiting.
+  // `isDown` overrides both: a source the backend has excluded from the live
+  // inference call (unreachable, being retried in the background) shows as
+  // errored rather than an indefinite "waiting" spinner.
   const renderTile = (
     key: string,
     slot: number,
     src: string,
     title: string,
-    waitingLabel: string
+    waitingLabel: string,
+    isDown = false
   ) => (
     <div key={key} className="overflow-hidden rounded-lg border border-border" style={{ height: "35vh", minHeight: "220px" }}>
-      {inferenceReady[slot] ? (
+      {isDown ? (
+        <div className="flex h-full flex-col items-center justify-center gap-2 bg-destructive/10 text-destructive">
+          <AlertCircle className="h-7 w-7" />
+          <div className="text-center">
+            <p className="text-sm font-medium">{title}</p>
+            <p className="text-xs mt-0.5">Camera unreachable — retrying in background...</p>
+          </div>
+        </div>
+      ) : inferenceReady[slot] ? (
         <GridCell cellNumber={slot as 2 | 3 | 4} src={src} mode="mjpeg" title={title} />
       ) : (
         <div className="flex h-full flex-col items-center justify-center gap-3 bg-muted/30 text-muted-foreground">
@@ -307,16 +337,22 @@ const LiveViewPage = () => {
         </div>
       ) : (
         <>
-          {(stream.modelCount > 0 || isMultiCamera) && (
-            <div className="flex items-start gap-3 rounded-lg border border-blue-200/50 bg-blue-50/50 p-3">
-              <AlertCircle className="h-5 w-5 shrink-0 text-blue-600 mt-0.5" />
-              <p className="text-sm font-medium text-blue-900">
-                {isMultiCamera
-                  ? `${stream.multiCameraCount} camera${stream.multiCameraCount !== 1 ? "s" : ""} running the same model — raw + inference tile per camera`
-                  : `${stream.modelCount} model${stream.modelCount !== 1 ? "s" : ""} running inference • tile 1 is raw stream`}
-              </p>
-            </div>
-          )}
+          {(stream.modelCount > 0 || isMultiCamera) && (() => {
+            const downCount = sourceStatus.filter((ok) => ok === false).length;
+            return (
+              <div className={`flex items-start gap-3 rounded-lg border p-3 ${
+                downCount > 0 ? "border-destructive/40 bg-destructive/10" : "border-blue-200/50 bg-blue-50/50"
+              }`}>
+                <AlertCircle className={`h-5 w-5 shrink-0 mt-0.5 ${downCount > 0 ? "text-destructive" : "text-blue-600"}`} />
+                <p className={`text-sm font-medium ${downCount > 0 ? "text-destructive" : "text-blue-900"}`}>
+                  {isMultiCamera
+                    ? `${stream.multiCameraCount} camera${stream.multiCameraCount !== 1 ? "s" : ""} running the same model — raw + inference tile per camera` +
+                      (downCount > 0 ? ` • ${downCount} unreachable, retrying in background` : "")
+                    : `${stream.modelCount} model${stream.modelCount !== 1 ? "s" : ""} running inference • tile 1 is raw stream`}
+                </p>
+              </div>
+            );
+          })()}
 
           <div className="flex items-center justify-between">
             <div className="text-sm text-muted-foreground">
@@ -341,7 +377,7 @@ const LiveViewPage = () => {
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     {inferenceSlots.map((slot) =>
-                      renderTile(`raw-${slot}`, slot, slotRawMjpegUrl(slot), rawTileTitle(slot), "Waiting for camera stream...")
+                      renderTile(`raw-${slot}`, slot, slotRawMjpegUrl(slot), rawTileTitle(slot), "Waiting for camera stream...", sourceStatus[slot - 2] === false)
                     )}
                   </div>
                 </div>
@@ -353,7 +389,7 @@ const LiveViewPage = () => {
                     </div>
                     <div className="grid grid-cols-2 gap-3">
                       {inferenceSlots.map((slot) =>
-                        renderTile(`inf-${slot}`, slot, slotMjpegUrl(slot), tileTitle(slot), "Waiting for inference stream...")
+                        renderTile(`inf-${slot}`, slot, slotMjpegUrl(slot), tileTitle(slot), "Waiting for inference stream...", sourceStatus[slot - 2] === false)
                       )}
                     </div>
                   </div>

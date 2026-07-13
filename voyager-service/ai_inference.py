@@ -28,7 +28,8 @@ import logging
 import threading
 import subprocess
 import shutil
-from multiprocessing import Process, Queue, Value, Event
+import concurrent.futures
+from multiprocessing import Process, Queue, Value, Event, Array
 from pathlib import Path
 from queue import Empty, Full, Queue as ThreadQueue
 
@@ -207,6 +208,63 @@ def _probe_frame_timestamp(fr) -> "float | None":
         if 1_600_000_000_000 < val < 4_000_000_000_000:  # epoch milliseconds
             return float(val) / 1000.0
     return None
+
+
+# ── Per-source reachability probing ───────────────────────────────────────────
+#
+# All sources go into a single create_inference_stream call (deliberate —
+# matches Axelera's own inference.py, and it's what makes the source_id demux
+# work). That means we can't isolate a dead camera INSIDE that call. Instead
+# we control what gets passed INTO it: probe every source before each
+# (re)init and only include the ones that currently respond, so one dead
+# camera excludes just itself instead of failing the whole multi-source
+# pipeline. A background watcher re-probes excluded sources so they rejoin
+# automatically once reachable again.
+
+_ffprobe_missing_warned = False
+
+
+def _probe_source(url: str, timeout: float = 4.0) -> bool:
+    """Best-effort RTSP reachability check via ffprobe. Uses the same udp
+    transport as the main pipeline (the test camera resets RTSP-over-TCP
+    after ~2s) and a short timeout — this is a liveness probe, not a full
+    connection, so it should resolve quickly either way."""
+    global _ffprobe_missing_warned
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-rtsp_transport", "udp",
+                "-timeout", str(int(timeout * 1_000_000)),  # microseconds
+                "-i", url,
+                "-show_entries", "stream=codec_type",
+                "-of", "csv=p=0",
+            ],
+            capture_output=True, text=True, timeout=timeout + 2,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except FileNotFoundError:
+        # ffprobe isn't installed in this container — fail OPEN (assume
+        # reachable) rather than closed. Fail-closed here would exclude
+        # every source on every probe (init, mid-session, watcher) and
+        # permanently disable multi-camera, which is worse than just not
+        # having per-source isolation.
+        if not _ffprobe_missing_warned:
+            logger.warning("ffprobe not found — per-source reachability probing disabled; "
+                            "assuming all sources reachable")
+            _ffprobe_missing_warned = True
+        return True
+    except Exception:
+        return False
+
+
+def _probe_sources(urls: list) -> list:
+    """Probe all URLs in parallel (so N cameras cost ~one timeout, not N).
+    Returns a list[bool] index-aligned to `urls`."""
+    if not urls:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(urls)) as ex:
+        return list(ex.map(_probe_source, urls))
 
 
 # ── HLS Writer ────────────────────────────────────────────────────────────────
@@ -398,15 +456,29 @@ def get_raw_hub_for_slot(slot_id: int) -> "FrameHub | None":
 # ── Inference worker ──────────────────────────────────────────────────────────
 
 def inference_worker(run_id: str, network_yaml: str, sources: list, base_slot: int,
-                     frame_queues: list, raw_frame_queues: list, stop_event):
+                     frame_queues: list, raw_frame_queues: list, source_status, stop_event):
     """
-    Single wginference process reading N sources at once (Axelera's own
-    inference.py pattern — one create_inference_stream call, multiple
-    positional source URLs). Each frame carries fr.source_id, 0-based and
-    index-aligned to the order `sources` were passed; route it to
-    frame_queues[fr.source_id] which feeds HLSWriter(base_slot + source_id).
-    raw_frame_queues[fr.source_id] gets the same frame's JPEG BEFORE overlays
-    are drawn (Phase 3 — per-camera raw MJPEG tiles, no extra ffmpeg process).
+    Single wginference process reading currently-reachable sources at once
+    (Axelera's own inference.py pattern — one create_inference_stream call,
+    multiple positional source URLs). `sources` is the FULL, fixed list
+    requested at session start — camera i always owns slot base_slot+i and
+    frame_queues[i]/raw_frame_queues[i], regardless of whether it's currently
+    included in the live call. `source_status` is a shared (multiprocessing)
+    array of 1/0 flags, index-aligned to `sources`, updated here and read by
+    the backend (via get_status()) to show per-camera up/down state.
+
+    Only sources with source_status[i] truthy are passed into
+    wginference.init() — a dead camera is excluded from THAT call instead of
+    failing the whole pipeline for every camera. Since excluding sources
+    shifts fr.source_id (positional in the reduced arg list), `active_indices`
+    maps each call's source_id back to the original camera index before
+    routing to frame_queues/raw_frame_queues. A background watcher re-probes
+    excluded sources and signals a fast reinit when one recovers; a source
+    dying mid-session is caught by the normal exception handler below, which
+    re-probes everyone and excludes whichever one(s) actually failed before
+    the next attempt — the SDK call itself can't tolerate a source dying
+    without failing, so "restart with the survivors" is the isolation
+    mechanism, not true in-pipeline isolation.
 
     NEVER add --frame-rate here — on this board's mppvideodec it aborts the
     process with "inplace_addstreamid: meta_key already exists".
@@ -430,6 +502,29 @@ def inference_worker(run_id: str, network_yaml: str, sources: list, base_slot: i
         total_frames   = 0
         logged_sources = 0  # bring-up aid: log fr.source_id for the first ~20 frames
 
+        # Background watcher: re-probes currently-excluded sources so they
+        # rejoin automatically once reachable again, without waiting for an
+        # unrelated error to bring the whole session back to the top of the
+        # retry loop. Signals via reinit_event; the frame loop below checks
+        # it and breaks out promptly to pick up the recovered source.
+        reinit_event = threading.Event()
+
+        def _source_watcher():
+            while not stop_event.is_set():
+                for i, url in enumerate(sources):
+                    if stop_event.is_set():
+                        return
+                    if not source_status[i] and _probe_source(url):
+                        logger.info("[%s] source %d recovered: %s", run_id, i, url)
+                        source_status[i] = 1
+                        reinit_event.set()
+                for _ in range(20):  # ~10s between probe passes, responsive to stop_event
+                    if stop_event.is_set():
+                        return
+                    time.sleep(0.5)
+
+        threading.Thread(target=_source_watcher, daemon=True, name=f"src-watch-{run_id}").start()
+
         # Diagnostic instrumentation (CLAUDE_CODE_FIX_MULTICAM_LATENCY.md):
         # per-source arrival rate, queue-drop counts, and (if the SDK exposes
         # one) frame staleness, logged every ~5s per source. Determines
@@ -443,11 +538,33 @@ def inference_worker(run_id: str, network_yaml: str, sources: list, base_slot: i
         while not stop_event.is_set():
             stream = None
             try:
+                # Only pass currently-reachable sources into the SDK call —
+                # excluding a dead one from THIS list is what keeps it from
+                # failing the whole pipeline. active_indices maps each
+                # resulting fr.source_id (positional in active_sources) back
+                # to the original camera index, since excluding a source
+                # shifts the positions of the ones after it.
+                active_indices = [i for i in range(len(sources)) if source_status[i]]
+                if not active_indices:
+                    logger.warning("[%s] no reachable sources — reprobing in 5s", run_id)
+                    for i, ok in enumerate(_probe_sources(sources)):
+                        source_status[i] = 1 if ok else 0
+                    for _ in range(10):
+                        if stop_event.is_set():
+                            break
+                        time.sleep(0.5)
+                    continue
+                active_sources = [sources[i] for i in active_indices]
+                if len(active_sources) < len(sources):
+                    excluded = [sources[i] for i in range(len(sources)) if i not in active_indices]
+                    logger.warning("[%s] starting with %d/%d source(s) — excluded (unreachable): %s",
+                                   run_id, len(active_sources), len(sources), excluded)
+
                 logger.info("[%s] connecting to %d source(s): %s (aipu_cores=%s)",
-                            run_id, len(sources), sources, AIPU_CORES)
+                            run_id, len(active_sources), active_sources, AIPU_CORES)
                 args    = parser.parse_args([
                     network_yaml,
-                    *sources,
+                    *active_sources,
                     "--no-display",
                     "--rtsp-latency", "0",
                     "--aipu-cores", AIPU_CORES,
@@ -459,13 +576,20 @@ def inference_worker(run_id: str, network_yaml: str, sources: list, base_slot: i
                 for fr in stream:
                     if stop_event.is_set():
                         break
+                    if reinit_event.is_set():
+                        logger.info("[%s] source availability changed — reinitializing", run_id)
+                        reinit_event.clear()
+                        break
                     if fr is None or fr.image is None:
                         continue
 
-                    sid = getattr(fr, "source_id", 0) or 0
+                    active_sid = getattr(fr, "source_id", 0) or 0
                     if logged_sources < 20:
-                        logger.info("[%s] frame source_id=%s", run_id, sid)
+                        logger.info("[%s] frame source_id=%s", run_id, active_sid)
                         logged_sources += 1
+                    if active_sid >= len(active_indices):
+                        continue
+                    sid = active_indices[active_sid]  # map back to the original camera index
                     if sid >= len(frame_queues):
                         continue
 
@@ -517,6 +641,15 @@ def inference_worker(run_id: str, network_yaml: str, sources: list, base_slot: i
             except Exception as e:
                 if stop_event.is_set():
                     break
+
+                # One of the active sources likely died — re-probe everyone
+                # (not just previously-excluded ones) so the next attempt
+                # excludes whichever one(s) actually failed instead of
+                # retrying the same set and failing again immediately. If
+                # nothing actually changed, this is a harmless no-op.
+                for i, ok in enumerate(_probe_sources(sources)):
+                    source_status[i] = 1 if ok else 0
+
                 err_str = str(e)
                 # MediaMTX down or auth error — wait longer before retry
                 if "authentication" in err_str.lower() or "NoneType" in err_str or "connection" in err_str.lower():
@@ -580,9 +713,24 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
     raw_frame_queues = [Queue(maxsize=10) for _ in sources]
     stop_event       = Event()
 
+    # Pre-flight probe so a dead camera doesn't even delay session start,
+    # let alone take the others down with it — excluded up front, retried by
+    # the worker's background watcher. If NOTHING probes reachable, don't
+    # exclude everything (e.g. a startup race for the legacy single-camera
+    # path, where this probes MediaMTX's relay before it's finished coming
+    # up) — fall back to the full list and let the existing connection-retry
+    # loop handle it.
+    initial_up = _probe_sources(sources)
+    if not any(initial_up):
+        initial_up = [True] * len(sources)
+    source_status = Array('b', [1 if ok else 0 for ok in initial_up])
+    for i, ok in enumerate(initial_up):
+        if not ok:
+            logger.warning("[%s] source %d unreachable at start — excluding: %s", run_id, i, sources[i])
+
     process = Process(
         target=inference_worker,
-        args=(run_id, network_yaml, sources, base_slot, frame_queues, raw_frame_queues, stop_event),
+        args=(run_id, network_yaml, sources, base_slot, frame_queues, raw_frame_queues, source_status, stop_event),
         daemon=False,
     )
     process.start()
@@ -613,16 +761,17 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
         raw_hubs.append(raw_hub)
 
     SESSIONS[run_id] = {
-        "process":     process,
-        "pgid":        pgid,
-        "writers":     writers,
-        "hubs":        hubs,
-        "raw_hubs":    raw_hubs,
-        "stop_event":  stop_event,
-        "base_slot":   base_slot,
-        "source_type": source_type,
-        "sources":     sources,
-        "network":     network_yaml,
+        "process":       process,
+        "pgid":          pgid,
+        "writers":       writers,
+        "hubs":          hubs,
+        "raw_hubs":      raw_hubs,
+        "stop_event":    stop_event,
+        "base_slot":     base_slot,
+        "source_type":   source_type,
+        "sources":       sources,
+        "source_status": source_status,
+        "network":       network_yaml,
     }
 
     # Watchdog: restart the inference process if it crashes (e.g. std::system_error from wginference)
@@ -639,7 +788,8 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
                 try:
                     new_proc = Process(
                         target=inference_worker,
-                        args=(run_id, network_yaml, sources, base_slot, frame_queues, raw_frame_queues, stop_event),
+                        args=(run_id, network_yaml, sources, base_slot, frame_queues,
+                              raw_frame_queues, source_status, stop_event),
                         daemon=False,
                     )
                     new_proc.start()
@@ -725,15 +875,19 @@ def stop_session(run_id: str) -> bool:
 def get_status() -> list:
     return [
         {
-            "run_id":    rid,
-            "base_slot": s["base_slot"],
-            "slots":     [w.slot_id for w in s["writers"]],
-            "pid":       s["process"].pid,
-            "alive":     s["process"].is_alive(),
-            "exitcode":  s["process"].exitcode,
-            "playlists": [w.playlist for w in s["writers"]],
-            "sources":   s["sources"],
-            "network":   s["network"],
+            "run_id":        rid,
+            "base_slot":     s["base_slot"],
+            "slots":         [w.slot_id for w in s["writers"]],
+            "pid":           s["process"].pid,
+            "alive":         s["process"].is_alive(),
+            "exitcode":      s["process"].exitcode,
+            "playlists":     [w.playlist for w in s["writers"]],
+            "sources":       s["sources"],
+            # 1 = currently included in the live wginference.init() call,
+            # 0 = excluded (unreachable at last probe, being retried in the
+            # background) — index-aligned to `sources`.
+            "source_status": list(s["source_status"]),
+            "network":       s["network"],
         }
         for rid, s in SESSIONS.items()
     ]

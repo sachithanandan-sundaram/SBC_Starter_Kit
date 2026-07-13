@@ -88,6 +88,7 @@ _multi_camera_session: dict = {
     "sources":         [],
     "inference_slots": [],
     "raw_slot":        1,
+    "run_id":          None,   # correlates with voyager-sdk's /inference/status sessions
 }
 
 
@@ -97,6 +98,7 @@ def _clear_multi_camera_session() -> None:
         "source_type":     None,
         "sources":         [],
         "inference_slots": [],
+        "run_id":          None,
     })
 
 
@@ -447,6 +449,7 @@ async def _start_multi_camera_stream(sources: list[str]) -> dict:
         "sources":         sources,
         "inference_slots": slots,
         "raw_slot":        1,
+        "run_id":          run_id,
     })
 
     return {
@@ -525,7 +528,7 @@ async def upload_video(file: UploadFile = File(...)):
 
 
 @router.get("/stream/status")
-def stream_status():
+async def stream_status():
     slots_out = {}
     for slot, state in _slots.items():
         if slot == 1:
@@ -541,9 +544,31 @@ def stream_status():
             "source_value": state.source_value,
         }
 
+    session = dict(_multi_camera_session)
+    # Per-camera reachability (dead camera isolation) — 1=included in the
+    # live inference call, 0=excluded/retrying. Lives in voyager-sdk's
+    # process, not here, so fetch it and merge in; best-effort, since a tile
+    # showing "unknown" briefly on a hiccup is much better than /stream/status
+    # itself failing.
+    source_status = [True] * len(session.get("sources", []))
+    if session.get("active") and session.get("run_id"):
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                resp = await client.get(f"{VOYAGER_BASE}/inference/status")
+            if resp.status_code == 200:
+                for s in resp.json().get("sessions", []):
+                    if s.get("run_id") == session["run_id"]:
+                        raw = s.get("source_status")
+                        if isinstance(raw, list):
+                            source_status = [bool(v) for v in raw]
+                        break
+        except Exception:
+            pass
+    session["source_status"] = source_status
+
     return {
         "slots":   slots_out,
-        "session": dict(_multi_camera_session),
+        "session": session,
     }
 
 
