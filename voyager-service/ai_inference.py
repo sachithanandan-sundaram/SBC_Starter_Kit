@@ -38,6 +38,14 @@ HLS_LIST_SIZE = 5
 HLS_QUALITY   = 55
 SDK_DIR       = os.getenv("SDK_DIR", "/home/voyager-sdk")
 RTSP_URL      = os.getenv("RTSP_URL", "rtsp://127.0.0.1:8554/live")
+# The Metis AIPU has 4 cores; customers/*/test.yaml pins aipu_cores: 1, which
+# caps throughput at ~17fps regardless of camera count. With N>=3 cameras
+# supplying ~15fps each, that 1-core cap is what caused the ~90s multi-camera
+# lag (excess frames piling into GStreamer's buffers) — not frame dropping.
+# --aipu-cores 4 measured at 64.9fps vs 17.1fps on 1 core, comfortably above
+# a 3-camera ~45fps supply. Configurable in case a deployment needs to share
+# the AIPU with something else.
+AIPU_CORES    = os.getenv("AIPU_CORES", "4")
 
 _active_sessions = Value('i', 0)
 
@@ -418,12 +426,14 @@ def inference_worker(run_id: str, network_yaml: str, sources: list,
         while not stop_event.is_set():
             stream = None
             try:
-                logger.info("[%s] connecting to %d source(s): %s", run_id, len(sources), sources)
+                logger.info("[%s] connecting to %d source(s): %s (aipu_cores=%s)",
+                            run_id, len(sources), sources, AIPU_CORES)
                 args    = parser.parse_args([
                     network_yaml,
                     *sources,
                     "--no-display",
                     "--rtsp-latency", "0",
+                    "--aipu-cores", AIPU_CORES,
                 ])
                 tracers = inf_tracers.create_tracers_from_args(args)
                 stream  = wginference.init(args, tracers)
