@@ -1,4 +1,5 @@
 import { createContext, useState, useEffect, ReactNode } from "react";
+import { toast } from "@/hooks/use-toast";
 
 export interface ActiveRecording {
   sessionId: string;
@@ -23,6 +24,25 @@ interface RecordingContextType {
   elapsedSeconds: (session: ActiveRecording) => number;
 }
 
+// Shape of GET /api/recordings/active's per-session entries — the backend's
+// ground truth for what's actually recording (an ffmpeg process really
+// running), independent of whatever this tab's local state believes.
+interface BackendRecordingSession {
+  session_id: string;
+  kind: "raw" | "inference";
+  camera_index: number;
+  slot: number | null;
+  filename: string;
+  elapsed_seconds: number;
+  paused: boolean;
+}
+
+const RECONCILE_INTERVAL_MS = 4000;
+
+function labelFor(kind: "raw" | "inference", cameraIndex: number, slot: number | null): string {
+  return kind === "raw" ? `Camera ${cameraIndex} — Raw` : `Camera ${(slot ?? cameraIndex + 1) - 1} — Inference`;
+}
+
 export const RecordingContext = createContext<RecordingContextType | undefined>(undefined);
 
 const RECORDING_STATE_KEY = "recordingState";
@@ -37,8 +57,9 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       savePath = saved || "";
     } catch { /* noop */ }
 
-    // Then restore active sessions (best-effort — if the backend process
-    // restarted, these will simply show as stopped/gone next poll)
+    // Then restore active sessions (best-effort — the reconciliation poll
+    // below corrects this against the backend within a few seconds either
+    // way, whether the process died while we were gone or is still running)
     try {
       const saved = localStorage.getItem(RECORDING_STATE_KEY);
       if (saved) {
@@ -82,6 +103,96 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       return next;
     });
   };
+
+  // ── Reconcile against backend truth ───────────────────────────────────────
+  // Local state only changes on Start/Stop/Pause/Resume responses — if an
+  // ffmpeg process dies on its own (killed, disk full, camera drops), the UI
+  // would otherwise keep showing "Recording…" with a happily incrementing
+  // timer forever. Poll the backend's actual process list and reconcile:
+  // sessions we think are running but the backend doesn't know about are
+  // dead (toast an error, drop them); sessions the backend knows about that
+  // we don't (e.g. localStorage was cleared, or another tab started one) are
+  // adopted so the UI reflects reality instead of hiding them.
+  useEffect(() => {
+    let cancelled = false;
+
+    const reconcile = async () => {
+      let res: Response;
+      try {
+        res = await fetch("/api/recordings/active");
+      } catch {
+        return; // network hiccup — don't flag anything dead over a transient failure
+      }
+      if (!res.ok || cancelled) return;
+
+      let backendSessions: BackendRecordingSession[];
+      try {
+        const data = await res.json();
+        backendSessions = Array.isArray(data.sessions) ? data.sessions : [];
+      } catch {
+        return;
+      }
+      if (cancelled) return;
+
+      const backendIds = new Set(backendSessions.map((s) => s.session_id));
+      let died: ActiveRecording[] = [];
+
+      setRecordingState((prev) => {
+        died = prev.sessions.filter((s) => !backendIds.has(s.sessionId));
+        const knownIds = new Set(prev.sessions.map((s) => s.sessionId));
+
+        const survivors = prev.sessions
+          .filter((s) => backendIds.has(s.sessionId))
+          .map((s) => {
+            const match = backendSessions.find((b) => b.session_id === s.sessionId)!;
+            // Keep pause state in sync in case another tab paused/resumed it.
+            if (match.paused && s.pausedAt === null) return { ...s, pausedAt: Date.now() };
+            if (!match.paused && s.pausedAt !== null) return { ...s, pausedAt: null };
+            return s;
+          });
+
+        const adopted: ActiveRecording[] = backendSessions
+          .filter((s) => !knownIds.has(s.session_id))
+          .map((s) => ({
+            sessionId: s.session_id,
+            kind: s.kind,
+            cameraIndex: s.camera_index,
+            slot: s.slot,
+            label: labelFor(s.kind, s.camera_index, s.slot),
+            filename: s.filename,
+            startTime: Date.now() - s.elapsed_seconds * 1000,
+            pausedAt: s.paused ? Date.now() : null,
+          }));
+
+        if (died.length === 0 && adopted.length === 0 &&
+            survivors.length === prev.sessions.length &&
+            survivors.every((s, i) => s === prev.sessions[i])) {
+          return prev; // nothing changed — skip the re-render/localStorage write
+        }
+
+        const nextSessions = [...survivors, ...adopted];
+        try {
+          localStorage.setItem(RECORDING_STATE_KEY, JSON.stringify({ sessions: nextSessions }));
+        } catch { /* storage quota — ignore */ }
+        return { ...prev, sessions: nextSessions };
+      });
+
+      died.forEach((s) => {
+        toast({
+          variant: "destructive",
+          title: "Recording stopped unexpectedly",
+          description: `${s.label} (${s.filename}) is no longer recording — check disk space or camera connectivity.`,
+        });
+      });
+    };
+
+    reconcile();
+    const interval = setInterval(reconcile, RECONCILE_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
 
   // ── Timer: forces a re-render every second so elapsedSeconds() below stays
   // live, without each consumer needing its own interval ────────────────────
