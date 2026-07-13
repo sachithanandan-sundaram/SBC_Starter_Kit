@@ -7,6 +7,7 @@ models_new.py
 - DELETE /api/models/{slot}                  Remove model + stop its stream
 """
 import logging
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -83,6 +84,16 @@ async def _voyager_deploy(deploy_id: str, model_name: str, yaml_content: str) ->
         raise HTTPException(503, f"voyager-sdk unreachable: {str(e)[:200]}")
 
 
+# deploy_id -> wall-clock time the FIRST 404 was seen for it. A 404 right
+# after starting a deploy usually just means voyager-sdk hasn't registered it
+# yet (or restarted and lost in-memory state) — treat that as "still queued"
+# for a bounded grace period. Past that, voyager-sdk has genuinely lost track
+# of it and polling forever would leave the UI spinning with no way to know
+# something's wrong; report it as failed instead.
+_deploy_404_since: dict[str, float] = {}
+DEPLOY_404_TIMEOUT_SECONDS = 30.0
+
+
 async def _voyager_deploy_status(deploy_id: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -91,8 +102,21 @@ async def _voyager_deploy_status(deploy_id: str) -> dict:
                 params={"deploy_id": deploy_id},
             )
         if resp.status_code == 404:
-            # voyager-sdk restarted and lost in-memory state — treat as still running
+            now = time.time()
+            first_seen = _deploy_404_since.setdefault(deploy_id, now)
+            if now - first_seen > DEPLOY_404_TIMEOUT_SECONDS:
+                _deploy_404_since.pop(deploy_id, None)
+                logger.warning("deploy_id %s still 404 after %.0fs — treating as failed",
+                               deploy_id, now - first_seen)
+                return {
+                    "done": True, "progress": None, "stage": "failed", "exit_code": -1,
+                    "log": ("voyager-sdk lost track of this deployment (no response after "
+                            f"{DEPLOY_404_TIMEOUT_SECONDS:.0f}s) — it may have restarted "
+                            "mid-deploy. Try deploying again."),
+                }
             return {"done": False, "progress": None, "stage": "queued", "exit_code": None, "log": ""}
+
+        _deploy_404_since.pop(deploy_id, None)
         if resp.status_code != 200:
             raise HTTPException(502, f"voyager-sdk status error: {resp.text[:200]}")
         return resp.json()
