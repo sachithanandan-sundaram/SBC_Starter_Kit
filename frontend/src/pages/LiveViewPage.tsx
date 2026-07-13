@@ -50,8 +50,10 @@ const LiveViewPage = () => {
       toast({ variant: "destructive", title: "Validation Error", description: validation.error || "Please enter a valid RTSP URL" });
       return;
     }
+    // Duplicates are allowed on purpose — useful for testing with one camera
+    // simulating several, and for cameras that expose multiple channels via
+    // the same base URL. Only the camera COUNT is capped.
     setRtspUrls((prev) => {
-      if (prev.includes(trimmed)) return prev;
       if (prev.length >= MAX_CAMERAS) {
         toast({ variant: "destructive", title: "Limit reached", description: `Maximum ${MAX_CAMERAS} cameras` });
         return prev;
@@ -60,8 +62,10 @@ const LiveViewPage = () => {
     });
   };
 
-  const handleRemoveRtspUrl = (url: string) => {
-    setRtspUrls((prev) => prev.filter((u) => u !== url));
+  const handleRemoveRtspUrl = (index: number) => {
+    // Index-based, not value-based — duplicate URLs are allowed, so
+    // filtering by value would remove every matching entry at once.
+    setRtspUrls((prev) => prev.filter((_, i) => i !== index));
   };
 
   const slotHlsUrl = (slot: number): string => {
@@ -303,11 +307,16 @@ const LiveViewPage = () => {
                   </p>
                   {rtspUrls.length > 0 && (
                     <div className="flex flex-col gap-0.5 rounded-md border border-border bg-muted/30 p-1">
-                      {rtspUrls.map((url) => (
-                        <div key={url} className="group flex items-center justify-between rounded px-2 py-1.5 hover:bg-muted">
-                          <span className="flex-1 truncate font-mono text-xs text-foreground">{url}</span>
+                      {rtspUrls.map((url, index) => (
+                        <div key={`${index}-${url}`} className="group flex items-center justify-between rounded px-2 py-1.5 hover:bg-muted">
+                          <span className="flex-1 truncate font-mono text-xs text-foreground">
+                            {url}
+                            {rtspUrls.filter((u) => u === url).length > 1 && (
+                              <span className="ml-1.5 text-muted-foreground">(#{index + 1})</span>
+                            )}
+                          </span>
                           <button
-                            onClick={() => handleRemoveRtspUrl(url)}
+                            onClick={() => handleRemoveRtspUrl(index)}
                             className="ml-2 shrink-0 text-muted-foreground hover:text-destructive"
                           >
                             <X className="h-3 w-3" />
