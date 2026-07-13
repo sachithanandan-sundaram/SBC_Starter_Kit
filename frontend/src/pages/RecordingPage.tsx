@@ -1,66 +1,87 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { useToast } from "@/hooks/use-toast";
 import { useStream } from "@/hooks/useStreamContext";
 import { useRecording } from "@/hooks/useRecording";
 import { RecordingState } from "@/contexts/RecordingContext";
-import { HlsPlayer } from "@/components/live/HlsPlayer";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { validateRecordingDuration } from "@/lib/validation";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 
-interface StreamSlot {
+interface RawCameraOption {
+  index: number;
+  label: string;
+}
+
+interface InferenceSlotOption {
   slot: number;
-  name: string;
-  available: boolean;
+  label: string;
 }
 
 const RecordingPage = () => {
   const { toast } = useToast();
   const { stream } = useStream();
-  const { recording, setRecording, recordingTime } = useRecording();
+  const { recording, setRecording, elapsedSeconds } = useRecording();
 
-  // Prevent duplicate requests
-  const isStoppingRef = useRef(false);
-  const isPausingRef = useRef(false);
+  // Per-row in-flight indicators, keyed by a request key (not session_id,
+  // since "start" hasn't produced one yet) or session_id for pause/stop.
+  const [busyKeys, setBusyKeys] = useState<Set<string>>(new Set());
+  const setBusy = (key: string, busy: boolean) => {
+    setBusyKeys((prev) => {
+      const next = new Set(prev);
+      if (busy) next.add(key); else next.delete(key);
+      return next;
+    });
+  };
 
-  // UI state for loading indicators
-  const [isStopping, setIsStopping] = useState(false);
-
-  // Poll available slots from /api/stream
-  const [availableSlots, setAvailableSlots] = useState<StreamSlot[]>([]);
+  // Raw camera feeds (from the multi-camera session, or the single legacy
+  // raw stream) and inference slots (from /api/stream) available to record.
+  const [rawCameras, setRawCameras] = useState<RawCameraOption[]>([]);
+  const [inferenceSlots, setInferenceSlots] = useState<InferenceSlotOption[]>([]);
 
   useEffect(() => {
     if (!stream.isStreaming) {
-      setAvailableSlots([]);
+      setRawCameras([]);
+      setInferenceSlots([]);
       return;
     }
 
     const load = async () => {
       try {
-        const res = await fetch("/api/stream");
-        if (!res.ok) return;
-        const data = await res.json();
-        const slots: StreamSlot[] = (data.streams || []).map((s: any) => ({
-          slot: s.slot,
-          name: s.slot === 1 ? "Raw Stream" : s.name || `Model ${s.slot - 1}`,
-          available: true,
-        }));
-        setAvailableSlots(slots);
+        const [statusRes, streamRes] = await Promise.all([
+          fetch("/api/stream/status"),
+          fetch("/api/stream"),
+        ]);
+
+        if (statusRes.ok) {
+          const status = await statusRes.json();
+          const session = status.session;
+          if (session?.active && Array.isArray(session.sources) && session.sources.length > 0) {
+            setRawCameras(session.sources.map((_: string, i: number) => ({ index: i, label: `Camera ${i}` })));
+          } else if (status.slots?.["1"]?.running) {
+            setRawCameras([{ index: 0, label: "Raw Stream" }]);
+          } else {
+            setRawCameras([]);
+          }
+        }
+
+        if (streamRes.ok) {
+          const data = await streamRes.json();
+          const slots: InferenceSlotOption[] = (data.streams || [])
+            .filter((s: any) => typeof s.slot === "number" && s.slot !== 1)
+            .map((s: any) => ({
+              slot: s.slot,
+              label: stream.multiCameraCount > 0 ? `Camera ${s.slot - 1}` : (s.name || `Model ${s.slot - 1}`),
+            }));
+          setInferenceSlots(slots);
+        }
       } catch { /* noop */ }
     };
 
     load();
     const interval = setInterval(load, 3000);
     return () => clearInterval(interval);
-  }, [stream.isStreaming]);
+  }, [stream.isStreaming, stream.multiCameraCount]);
 
   const handleSavePath = () => {
     if (!recording.savePath.trim()) {
@@ -68,45 +89,30 @@ const RecordingPage = () => {
       return;
     }
     const trimmed = recording.savePath.trim();
-    // Context's setRecording will handle localStorage persistence and custom event
     setRecording((prev: RecordingState) => ({ ...prev, savePath: trimmed }));
     toast({ title: "Save folder set", description: trimmed });
   };
 
-  const slotDisplayLabel = (slot: StreamSlot): string => {
-    if (slot.slot === 1) return "Raw Stream";
-    return `${slot.name} — Slot ${slot.slot - 1}`;
-  };
-
-  const getSlotHlsUrl = (slot: number): string => {
-    return `/api/stream/slot/${slot}/index.m3u8`;
-  };
-
-  const handleStartRecording = async () => {
-    if (!stream.isStreaming) {
-      toast({ variant: "destructive", title: "No active stream", description: "Start a stream first." });
-      return;
-    }
-    if (!recording.selectedSlot) {
-      toast({ variant: "destructive", title: "Select a slot", description: "Choose which stream to record." });
-      return;
-    }
+  const startRecording = async (
+    kind: "raw" | "inference",
+    cameraIndex: number,
+    slot: number | null,
+    label: string,
+    requestKey: string
+  ) => {
     if (!recording.savePath) {
       toast({ variant: "destructive", title: "No save folder", description: "Enter and save a folder path first." });
       return;
     }
-
-    const internalSlot = parseInt(recording.selectedSlot, 10);
-    const slotInfo = availableSlots.find((s: StreamSlot) => s.slot === internalSlot);
-    const modelName = slotInfo && slotInfo.slot !== 1 ? slotInfo.name : undefined;
-
+    setBusy(requestKey, true);
     try {
       const res = await fetch("/api/recordings/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          slot: internalSlot,
-          model_name: modelName,
+          kind,
+          camera_index: cameraIndex,
+          slot: slot ?? undefined,
           save_path: recording.savePath,
         }),
       });
@@ -115,132 +121,126 @@ const RecordingPage = () => {
         throw new Error(err.detail || "Failed to start recording");
       }
       const data = await res.json();
+      const now = Date.now();
       setRecording((prev: RecordingState) => ({
         ...prev,
-        sessionId: data.session_id,
-        isRecording: true,
-        isPaused: false,
-        recordingStartTime: Date.now(),
+        sessions: [
+          ...prev.sessions,
+          {
+            sessionId: data.session_id,
+            kind,
+            cameraIndex,
+            slot,
+            label,
+            filename: data.filename,
+            startTime: now,
+            pausedAt: null,
+          },
+        ],
       }));
-      toast({ title: "Recording Started", description: slotInfo ? slotDisplayLabel(slotInfo) : `Slot ${recording.selectedSlot}` });
+      toast({ title: "Recording Started", description: label });
     } catch (err) {
       toast({ variant: "destructive", title: "Error", description: err instanceof Error ? err.message : "Failed to start recording" });
+    } finally {
+      setBusy(requestKey, false);
     }
   };
 
-  const handlePauseRecording = async () => {
-    if (!recording.sessionId || isPausingRef.current) return;
-    isPausingRef.current = true;
+  const pauseRecording = async (sessionId: string) => {
+    setBusy(sessionId, true);
     try {
       const res = await fetch("/api/recordings/pause", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: recording.sessionId }),
+        body: JSON.stringify({ session_id: sessionId }),
       });
       if (!res.ok) throw new Error("Failed to pause");
       setRecording((prev: RecordingState) => ({
         ...prev,
-        isPaused: true,
-        recordingPausedAt: Date.now(),
+        sessions: prev.sessions.map((s) =>
+          s.sessionId === sessionId ? { ...s, pausedAt: Date.now() } : s
+        ),
       }));
-      toast({ title: "Recording Paused" });
     } catch (err) {
       toast({ variant: "destructive", title: "Error", description: err instanceof Error ? err.message : "Failed to pause" });
     } finally {
-      isPausingRef.current = false;
+      setBusy(sessionId, false);
     }
   };
 
-  const handleResumeRecording = async () => {
-    if (!recording.sessionId) return;
+  const resumeRecording = async (sessionId: string) => {
+    setBusy(sessionId, true);
     try {
       const res = await fetch("/api/recordings/resume", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: recording.sessionId }),
+        body: JSON.stringify({ session_id: sessionId }),
       });
       if (!res.ok) throw new Error("Failed to resume");
-      // Calculate pause duration and adjust recordingStartTime forward
-      setRecording((prev: RecordingState) => {
-        let newStartTime = prev.recordingStartTime;
-        if (prev.recordingPausedAt && prev.recordingStartTime) {
-          // Shift the start time forward by the pause duration
-          const pauseDuration = Date.now() - prev.recordingPausedAt;
-          newStartTime = prev.recordingStartTime + pauseDuration;
-        }
-        return {
-          ...prev,
-          isPaused: false,
-          recordingStartTime: newStartTime,
-          recordingPausedAt: null, // Clear pause tracking
-        };
-      });
-      toast({ title: "Recording Resumed" });
+      setRecording((prev: RecordingState) => ({
+        ...prev,
+        sessions: prev.sessions.map((s) => {
+          if (s.sessionId !== sessionId) return s;
+          const pauseDuration = s.pausedAt ? Date.now() - s.pausedAt : 0;
+          return { ...s, startTime: s.startTime + pauseDuration, pausedAt: null };
+        }),
+      }));
     } catch (err) {
       toast({ variant: "destructive", title: "Error", description: err instanceof Error ? err.message : "Failed to resume" });
+    } finally {
+      setBusy(sessionId, false);
     }
   };
 
-  const handleStopRecording = async () => {
-    if (!recording.sessionId || isStoppingRef.current) {
-      if (!recording.sessionId) {
-        toast({ variant: "destructive", title: "Error", description: "No active recording session" });
-      }
-      return;
-    }
+  const stopRecording = async (sessionId: string) => {
+    const session = recording.sessions.find((s) => s.sessionId === sessionId);
+    if (!session) return;
 
-    // Validate recording duration — must be at least 1 second
-    const validation = validateRecordingDuration(recordingTime, 1);
+    const validation = validateRecordingDuration(elapsedSeconds(session), 1);
     if (!validation.valid) {
       toast({ variant: "destructive", title: "Recording Too Short", description: validation.error });
       return;
     }
 
-    isStoppingRef.current = true;
-    setIsStopping(true);
-
+    setBusy(sessionId, true);
     try {
       const res = await fetch("/api/recordings/stop", {
         method: "POST",
-        headers: { "Content-Type": "application/json"},
-        body: JSON.stringify({ session_id: recording.sessionId }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
       });
-
       if (!res.ok) {
         const errText = await res.text();
         throw new Error(errText);
       }
-
       const data = await res.json();
       const mins = Math.floor(data.duration_seconds / 60);
       const secs = Math.floor(data.duration_seconds % 60);
       setRecording((prev: RecordingState) => ({
         ...prev,
-        sessionId: null,
-        isRecording: false,
-        isPaused: false,
-        recordingStartTime: null,
-        recordingPausedAt: null,
+        sessions: prev.sessions.filter((s) => s.sessionId !== sessionId),
       }));
       toast({ title: "Recording Saved", description: `${data.filename} — ${mins}m ${secs}s` });
     } catch (err) {
       toast({ variant: "destructive", title: "Error", description: err instanceof Error ? err.message : "Failed to stop recording" });
     } finally {
-      isStoppingRef.current = false;
-      setIsStopping(false);
+      setBusy(sessionId, false);
     }
   };
 
   const formatTime = (seconds: number): string => {
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
-    const s = seconds % 60;
+    const s = Math.floor(seconds % 60);
     if (h > 0) return `${h}h ${m}m ${s}s`;
     if (m > 0) return `${m}m ${s}s`;
     return `${s}s`;
   };
 
-  const selectedSlotInfo = availableSlots.find((s: StreamSlot) => s.slot === parseInt(recording.selectedSlot || "0"));
+  const isRawRecording = (index: number) =>
+    recording.sessions.some((s) => s.kind === "raw" && s.cameraIndex === index);
+  const isInferenceRecording = (slot: number) =>
+    recording.sessions.some((s) => s.kind === "inference" && s.slot === slot);
 
   return (
     <div className="flex flex-col space-y-6">
@@ -253,7 +253,7 @@ const RecordingPage = () => {
           <div className="flex gap-2">
             <Input
               type="text"
-              placeholder="e.g. /home/pi/recordings"
+              placeholder="e.g. /home/user/recordings"
               value={recording.savePath}
               onChange={(e: any) => setRecording((prev: RecordingState) => ({ ...prev, savePath: e.currentTarget.value }))}
               className="flex-1"
@@ -263,99 +263,112 @@ const RecordingPage = () => {
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            Enter an absolute path on your Raspberry Pi. The folder will be created if it doesn't exist.
+            Enter an absolute path on this Metis Compute Board (host filesystem). The folder will be created if it doesn't exist.
           </p>
         </div>
 
-        <div className="space-y-2">
-          <Label>Record From</Label>
-          {!stream.isStreaming ? (
-            <div className="rounded-md border border-dashed border-border bg-muted/50 p-3 text-sm text-muted-foreground">
-              No active stream — start a stream first
-            </div>
-          ) : availableSlots.length === 0 ? (
-            <div className="rounded-md border border-dashed border-border bg-muted/50 p-3 text-sm text-muted-foreground">
-              Loading streams...
-            </div>
-          ) : (
-            <Select
-              value={recording.selectedSlot ?? undefined}
-              onValueChange={(val: string) => setRecording((prev: RecordingState) => ({ ...prev, selectedSlot: val }))}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Select Slot" />
-              </SelectTrigger>
-              <SelectContent>
-                {availableSlots.map((s: StreamSlot) => (
-                  <SelectItem key={s.slot} value={String(s.slot)}>
-                    {slotDisplayLabel(s)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          )}
-        </div>
-
-        <Button
-          onClick={handleStartRecording}
-          disabled={recording.isRecording || !stream.isStreaming || !recording.selectedSlot || !recording.savePath || availableSlots.length === 0}
-          className="w-full"
-        >
-          Start Recording
-        </Button>
-      </div>
-
-      {/* Active recording */}
-      {recording.isRecording && (
-        <div className="rounded-lg border border-border bg-card p-6 space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-lg font-semibold">Recording in Progress</h3>
-              <p className="text-sm text-muted-foreground">
-                {selectedSlotInfo ? slotDisplayLabel(selectedSlotInfo) : `Slot ${recording.selectedSlot}`}
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              {!recording.isPaused && (
-                <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-red-500" />
+        {!stream.isStreaming ? (
+          <div className="rounded-md border border-dashed border-border bg-muted/50 p-3 text-sm text-muted-foreground">
+            No active stream — start a stream first
+          </div>
+        ) : (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label>Raw Feeds</Label>
+              {rawCameras.length === 0 ? (
+                <div className="rounded-md border border-dashed border-border bg-muted/50 p-3 text-sm text-muted-foreground">
+                  No raw feed available
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {rawCameras.map((cam) => {
+                    const key = `raw-${cam.index}`;
+                    const recording_ = isRawRecording(cam.index);
+                    return (
+                      <div key={key} className="flex items-center justify-between rounded-md border border-border p-2">
+                        <span className="text-sm">{cam.label}</span>
+                        <Button
+                          size="sm"
+                          variant={recording_ ? "secondary" : "default"}
+                          disabled={recording_ || busyKeys.has(key) || !recording.savePath}
+                          onClick={() => startRecording("raw", cam.index, null, `${cam.label} — Raw`, key)}
+                        >
+                          {recording_ ? "Recording…" : "Record"}
+                        </Button>
+                      </div>
+                    );
+                  })}
+                </div>
               )}
-              <div className="text-3xl font-mono font-bold">{formatTime(recordingTime)}</div>
+            </div>
+
+            <div className="space-y-2">
+              <Label>Inference Feeds</Label>
+              {inferenceSlots.length === 0 ? (
+                <div className="rounded-md border border-dashed border-border bg-muted/50 p-3 text-sm text-muted-foreground">
+                  No inference stream available yet
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {inferenceSlots.map((s) => {
+                    const key = `inf-${s.slot}`;
+                    const recording_ = isInferenceRecording(s.slot);
+                    return (
+                      <div key={key} className="flex items-center justify-between rounded-md border border-border p-2">
+                        <span className="text-sm">{s.label}</span>
+                        <Button
+                          size="sm"
+                          variant={recording_ ? "secondary" : "default"}
+                          disabled={recording_ || busyKeys.has(key) || !recording.savePath}
+                          onClick={() => startRecording("inference", s.slot - 1, s.slot, `${s.label} — Inference`, key)}
+                        >
+                          {recording_ ? "Recording…" : "Record"}
+                        </Button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
+        )}
+      </div>
 
-          {/* Video preview and controls side by side */}
-          <div className="flex gap-4">
-            {/* Live preview of recording slot */}
-            {recording.selectedSlot && recording.isRecording && (
-              <div className="w-2/3">
-                <div className="rounded-lg border border-border bg-black/10 overflow-hidden">
-                  <div className="aspect-video w-full bg-black flex items-center justify-center">
-                    <HlsPlayer src={getSlotHlsUrl(parseInt(recording.selectedSlot, 10))} showPlaceholder={false} />
+      {/* Active recordings */}
+      {recording.sessions.length > 0 && (
+        <div className="rounded-lg border border-border bg-card p-6 space-y-3">
+          <h3 className="text-lg font-semibold">Active Recordings</h3>
+          <div className="flex flex-col gap-2">
+            {recording.sessions.map((s) => {
+              const busy = busyKeys.has(s.sessionId);
+              const paused = s.pausedAt !== null;
+              return (
+                <div key={s.sessionId} className="flex items-center justify-between rounded-md border border-border p-3">
+                  <div className="flex items-center gap-3">
+                    {!paused && <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-red-500" />}
+                    <div>
+                      <p className="text-sm font-medium">{s.label}</p>
+                      <p className="text-xs text-muted-foreground font-mono">{s.filename}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="text-lg font-mono font-semibold">{formatTime(elapsedSeconds(s))}</div>
+                    {paused ? (
+                      <Button size="sm" variant="outline" disabled={busy} onClick={() => resumeRecording(s.sessionId)}>
+                        Resume
+                      </Button>
+                    ) : (
+                      <Button size="sm" variant="outline" disabled={busy} onClick={() => pauseRecording(s.sessionId)}>
+                        Pause
+                      </Button>
+                    )}
+                    <Button size="sm" variant="destructive" disabled={busy} onClick={() => stopRecording(s.sessionId)}>
+                      Stop & Save
+                    </Button>
                   </div>
                 </div>
-              </div>
-            )}
-
-            {/* Control buttons */}
-            <div className="w-1/3 flex flex-col gap-2">
-              {recording.isPaused ? (
-                <Button onClick={handleResumeRecording} disabled={isPausingRef.current} className="w-full">
-                  Resume
-                </Button>
-              ) : (
-                <Button onClick={handlePauseRecording} variant="outline" disabled={isPausingRef.current} className="w-full">
-                  Pause
-                </Button>
-              )}
-              <Button 
-                onClick={handleStopRecording} 
-                variant="destructive" 
-                disabled={isStopping || isStoppingRef.current}
-                className="w-full"
-              >
-                {isStopping ? "Saving..." : "Stop & Save"}
-              </Button>
-            </div>
+              );
+            })}
           </div>
         </div>
       )}

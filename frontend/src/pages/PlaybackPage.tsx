@@ -10,6 +10,17 @@ interface VideoFile {
   duration_s: number;
 }
 
+// Recordings are named "<timestamp>_cam<N>_<raw|inference>.mp4" (see
+// backend/app/routers/recordings.py::_make_filename). Parse that back out so
+// the list can show camera + type without any backend schema change.
+const FILENAME_PATTERN = /^\d{8}-\d{6}_cam(\d+)_(raw|inference)\.mp4$/;
+
+function parseRecordingMeta(filename: string): { camera: number; kind: "raw" | "inference" } | null {
+  const match = FILENAME_PATTERN.exec(filename);
+  if (!match) return null;
+  return { camera: parseInt(match[1], 10), kind: match[2] as "raw" | "inference" };
+}
+
 const FILES_CACHE_KEY = "playbackFilesCache";
 const POLL_INTERVAL_MS = 10_000; // 10 s — backend ffprobe is now cached, but no need to hammer it
 
@@ -201,27 +212,44 @@ const PlaybackPage = () => {
             </div>
           ) : (
             <div className="flex flex-col gap-2 overflow-y-auto">
-              {files.map((file) => (
-                <button
-                  key={file.filename}
-                  onClick={() => {
-                    setSelectedFile(file);
-                    setSelectedFileName(file.filename);
-                  }}
-                  className={`rounded-lg border p-3 text-left transition-all ${
-                    selectedFile?.filename === file.filename
-                      ? "border-primary bg-primary/10"
-                      : "border-border hover:bg-muted"
-                  }`}
-                >
-                  <div className="truncate font-mono text-sm font-medium">
-                    {file.filename}
-                  </div>
-                  <div className="mt-1 text-xs text-muted-foreground">
-                    {formatDuration(file.duration_s)} • {formatDate(file.modified)}
-                  </div>
-                </button>
-              ))}
+              {files.map((file) => {
+                const meta = parseRecordingMeta(file.filename);
+                return (
+                  <button
+                    key={file.filename}
+                    onClick={() => {
+                      setSelectedFile(file);
+                      setSelectedFileName(file.filename);
+                    }}
+                    className={`rounded-lg border p-3 text-left transition-all ${
+                      selectedFile?.filename === file.filename
+                        ? "border-primary bg-primary/10"
+                        : "border-border hover:bg-muted"
+                    }`}
+                  >
+                    {meta && (
+                      <div className="mb-1 flex items-center gap-1.5">
+                        <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                          Camera {meta.camera}
+                        </span>
+                        <span
+                          className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                            meta.kind === "raw" ? "bg-slate-200 text-slate-700" : "bg-blue-100 text-blue-700"
+                          }`}
+                        >
+                          {meta.kind}
+                        </span>
+                      </div>
+                    )}
+                    <div className="truncate font-mono text-sm font-medium">
+                      {file.filename}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {formatDuration(file.duration_s)} • {formatDate(file.modified)}
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>
@@ -230,7 +258,27 @@ const PlaybackPage = () => {
         <div className="flex flex-col gap-3">
           {selectedFile ? (
             <>
-              <div className="text-sm font-semibold">{selectedFile.filename}</div>
+              <div className="flex items-center gap-2">
+                <div className="text-sm font-semibold">{selectedFile.filename}</div>
+                {(() => {
+                  const meta = parseRecordingMeta(selectedFile.filename);
+                  if (!meta) return null;
+                  return (
+                    <>
+                      <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                        Camera {meta.camera}
+                      </span>
+                      <span
+                        className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                          meta.kind === "raw" ? "bg-slate-200 text-slate-700" : "bg-blue-100 text-blue-700"
+                        }`}
+                      >
+                        {meta.kind}
+                      </span>
+                    </>
+                  );
+                })()}
+              </div>
               <div className="aspect-video w-full overflow-hidden rounded-lg border border-border bg-black">
                 <video
                   key={selectedFile.filename}
