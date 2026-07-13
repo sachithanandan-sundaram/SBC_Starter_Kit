@@ -321,19 +321,21 @@ class HLSWriter:
 
 # ── Frame hub (fan-out for MJPEG live view) ───────────────────────────────────
 #
-# The inference child process writes annotated JPEGs into one multiprocessing
-# Queue per source. HLSWriter used to `.get()` directly from that queue — fine
-# when it was the only consumer, but Queue.get() is destructive: a second
-# consumer (an MJPEG viewer) would steal every other frame instead of seeing
-# every frame HLSWriter sees. FrameHub drains the mp Queue once and republishes
-# each JPEG to HLSWriter's own in-process queue plus any number of live MJPEG
-# subscriber queues, so recording (Phase 1) and low-latency live view (this
-# phase) both get every frame independently.
+# The inference child process writes JPEGs into one multiprocessing Queue per
+# source (one hub for annotated frames feeding HLSWriter, and — since Phase 3
+# — a second hub per source for the pre-overlay raw frame). HLSWriter used to
+# `.get()` directly from the annotated queue — fine when it was the only
+# consumer, but Queue.get() is destructive: a second consumer (an MJPEG
+# viewer) would steal every other frame instead of seeing every frame
+# HLSWriter sees. FrameHub drains the mp Queue once and republishes each JPEG
+# to HLSWriter's own in-process queue (annotated hub only — the raw hub has
+# no HLS/recording consumer, so `with_hls_queue=False` skips that bookkeeping)
+# plus any number of live MJPEG subscriber queues.
 
 class FrameHub:
-    def __init__(self, mp_frame_queue: Queue):
+    def __init__(self, mp_frame_queue: Queue, with_hls_queue: bool = True):
         self.mp_frame_queue = mp_frame_queue
-        self.hls_queue: ThreadQueue = ThreadQueue(maxsize=30)
+        self.hls_queue: "ThreadQueue | None" = ThreadQueue(maxsize=30) if with_hls_queue else None
         self._subscribers: list[ThreadQueue] = []
         self._sub_lock = threading.Lock()
         self._stop = threading.Event()
@@ -348,7 +350,8 @@ class FrameHub:
                 jpeg = self.mp_frame_queue.get(timeout=1.0)
             except Empty:
                 continue
-            push_frame(self.hls_queue, jpeg)
+            if self.hls_queue is not None:
+                push_frame(self.hls_queue, jpeg)
             with self._sub_lock:
                 subs = list(self._subscribers)
             for q in subs:
@@ -380,16 +383,30 @@ def get_hub_for_slot(slot_id: int) -> "FrameHub | None":
     return None
 
 
+def get_raw_hub_for_slot(slot_id: int) -> "FrameHub | None":
+    """Same slot-id → index lookup as get_hub_for_slot, but for the raw
+    (pre-overlay) hub — index-aligned with `writers`/`hubs` since all three
+    lists are built together per source in start_session."""
+    for session in SESSIONS.values():
+        for i, w in enumerate(session.get("writers", [])):
+            if w.slot_id == slot_id:
+                raw_hubs = session.get("raw_hubs", [])
+                return raw_hubs[i] if i < len(raw_hubs) else None
+    return None
+
+
 # ── Inference worker ──────────────────────────────────────────────────────────
 
-def inference_worker(run_id: str, network_yaml: str, sources: list,
-                     base_slot: int, frame_queues: list, stop_event):
+def inference_worker(run_id: str, network_yaml: str, sources: list, base_slot: int,
+                     frame_queues: list, raw_frame_queues: list, stop_event):
     """
     Single wginference process reading N sources at once (Axelera's own
     inference.py pattern — one create_inference_stream call, multiple
     positional source URLs). Each frame carries fr.source_id, 0-based and
     index-aligned to the order `sources` were passed; route it to
     frame_queues[fr.source_id] which feeds HLSWriter(base_slot + source_id).
+    raw_frame_queues[fr.source_id] gets the same frame's JPEG BEFORE overlays
+    are drawn (Phase 3 — per-camera raw MJPEG tiles, no extra ffmpeg process).
 
     NEVER add --frame-rate here — on this board's mppvideodec it aborts the
     process with "inplace_addstreamid: meta_key already exists".
@@ -457,6 +474,15 @@ def inference_worker(run_id: str, network_yaml: str, sources: list,
                     st["count"] += 1
 
                     frame = fr.image.asarray('BGR').copy()
+
+                    # Snapshot the raw (pre-overlay) frame BEFORE draw_overlays_bgr
+                    # runs — it draws directly onto `frame` in place and returns
+                    # that same array, so this must happen first or the "raw"
+                    # JPEG would already have boxes on it.
+                    raw_jpeg = encode_jpeg(frame)
+                    if raw_jpeg and sid < len(raw_frame_queues):
+                        push_frame(raw_frame_queues[sid], raw_jpeg)
+
                     frame, _, _ = wginference.draw_overlays_bgr(frame, fr.meta)
                     jpeg = encode_jpeg(frame)
                     if jpeg:
@@ -545,12 +571,18 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
     with _active_sessions.get_lock():
         _active_sessions.value += 1
 
-    frame_queues = [Queue(maxsize=30) for _ in sources]
-    stop_event   = Event()
+    frame_queues     = [Queue(maxsize=30) for _ in sources]
+    # Smaller cap than frame_queues — raw has no HLSWriter/ffmpeg-pipe stall
+    # to buffer against, just the FrameHub thread draining it into MJPEG
+    # subscriber queues, so it doesn't need as much slack. Bounded + drop-
+    # oldest either way (see push_frame), so this only affects worst-case
+    # memory, not correctness.
+    raw_frame_queues = [Queue(maxsize=10) for _ in sources]
+    stop_event       = Event()
 
     process = Process(
         target=inference_worker,
-        args=(run_id, network_yaml, sources, base_slot, frame_queues, stop_event),
+        args=(run_id, network_yaml, sources, base_slot, frame_queues, raw_frame_queues, stop_event),
         daemon=False,
     )
     process.start()
@@ -565,8 +597,9 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
         except OSError:
             time.sleep(0.05)
 
-    hubs    = []
-    writers = []
+    hubs     = []
+    raw_hubs = []
+    writers  = []
     for i in range(len(sources)):
         hub = FrameHub(frame_queues[i])
         hub.start()
@@ -575,11 +608,16 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
         hubs.append(hub)
         writers.append(w)
 
+        raw_hub = FrameHub(raw_frame_queues[i], with_hls_queue=False)
+        raw_hub.start()
+        raw_hubs.append(raw_hub)
+
     SESSIONS[run_id] = {
         "process":     process,
         "pgid":        pgid,
         "writers":     writers,
         "hubs":        hubs,
+        "raw_hubs":    raw_hubs,
         "stop_event":  stop_event,
         "base_slot":   base_slot,
         "source_type": source_type,
@@ -601,7 +639,7 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
                 try:
                     new_proc = Process(
                         target=inference_worker,
-                        args=(run_id, network_yaml, sources, base_slot, frame_queues, stop_event),
+                        args=(run_id, network_yaml, sources, base_slot, frame_queues, raw_frame_queues, stop_event),
                         daemon=False,
                     )
                     new_proc.start()
@@ -676,6 +714,8 @@ def stop_session(run_id: str) -> bool:
     for w in session.get("writers", []):
         w.stop()
     for hub in session.get("hubs", []):
+        hub.stop()
+    for hub in session.get("raw_hubs", []):
         hub.stop()
 
     logger.info("[%s] session stopped", run_id)

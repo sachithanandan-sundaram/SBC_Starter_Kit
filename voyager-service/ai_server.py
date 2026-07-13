@@ -10,7 +10,8 @@ Endpoints:
   POST /inference/start
   POST /inference/stop
   GET  /inference/status
-  GET  /inference/stream/{slot}   MJPEG live view (multipart/x-mixed-replace)
+  GET  /inference/stream/{slot}   MJPEG live view, annotated (multipart/x-mixed-replace)
+  GET  /inference/raw/{slot}      MJPEG live view, raw/pre-overlay
   GET  /hls/slot-{n}/index.m3u8
   GET  /hls/slot-{n}/{segment}
   POST /models/upload-weights
@@ -40,6 +41,7 @@ from ai_inference import (
     stop_session,
     get_status,
     get_hub_for_slot,
+    get_raw_hub_for_slot,
     shutdown_handler,
     SESSIONS,
 )
@@ -371,12 +373,7 @@ def inference_status():
 MJPEG_BOUNDARY = "frame"
 
 
-@app.get("/inference/stream/{slot}")
-def inference_mjpeg_stream(slot: int):
-    hub = get_hub_for_slot(slot)
-    if hub is None:
-        raise HTTPException(404, f"No active inference stream for slot {slot}")
-
+def _mjpeg_response(hub) -> StreamingResponse:
     def _gen():
         q = hub.subscribe()
         try:
@@ -402,6 +399,26 @@ def inference_mjpeg_stream(slot: int):
         media_type=f"multipart/x-mixed-replace; boundary={MJPEG_BOUNDARY}",
         headers={"Cache-Control": "no-store, no-cache"},
     )
+
+
+@app.get("/inference/stream/{slot}")
+def inference_mjpeg_stream(slot: int):
+    hub = get_hub_for_slot(slot)
+    if hub is None:
+        raise HTTPException(404, f"No active inference stream for slot {slot}")
+    return _mjpeg_response(hub)
+
+
+@app.get("/inference/raw/{slot}")
+def raw_mjpeg_stream(slot: int):
+    """Phase 3: per-camera raw (pre-overlay) MJPEG, captured from the same
+    frame before draw_overlays_bgr runs — no extra ffmpeg process, and stays
+    frame-synced with the annotated tile since both come from the same
+    inference_worker iteration."""
+    hub = get_raw_hub_for_slot(slot)
+    if hub is None:
+        raise HTTPException(404, f"No active raw stream for slot {slot}")
+    return _mjpeg_response(hub)
 
 
 # ── HLS file serving ──────────────────────────────────────────────────────────

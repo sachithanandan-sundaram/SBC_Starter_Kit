@@ -72,6 +72,13 @@ const LiveViewPage = () => {
     return `/api/stream/slot/${slot}/mjpeg${fragment}`;
   };
 
+  // Per-camera raw (pre-overlay) tile — same slot numbering as the paired
+  // inference tile, same sub-second latency, no MediaMTX/HLS involved.
+  const slotRawMjpegUrl = (slot: number): string => {
+    const fragment = stream.sessionToken ? `#${stream.sessionToken}` : "";
+    return `/api/stream/slot/${slot}/raw.mjpeg${fragment}`;
+  };
+
   const handleStartStream = async () => {
     let sourceType: SourceType | null = null;
     let sourceValue: string | null = null;
@@ -205,9 +212,36 @@ const LiveViewPage = () => {
       : [];
 
   const tileTitle = (slot: number): string => {
-    if (isMultiCamera) return `Camera ${slot - 1}`;
+    if (isMultiCamera) return `Camera ${slot - 1} — Inference`;
     return slotTitles[slot] || `Model ${slot - 1}`;
   };
+
+  const rawTileTitle = (slot: number): string => `Camera ${slot - 1} — Raw`;
+
+  // Shared tile renderer for both the raw and inference grids in multi-camera
+  // mode — same readiness gating (both hubs for a camera come online
+  // together, part of the same session), same placeholder while waiting.
+  const renderTile = (
+    key: string,
+    slot: number,
+    src: string,
+    title: string,
+    waitingLabel: string
+  ) => (
+    <div key={key} className="overflow-hidden rounded-lg border border-border" style={{ height: "35vh", minHeight: "220px" }}>
+      {inferenceReady[slot] ? (
+        <GridCell cellNumber={slot as 2 | 3 | 4} src={src} mode="mjpeg" title={title} />
+      ) : (
+        <div className="flex h-full flex-col items-center justify-center gap-3 bg-muted/30 text-muted-foreground">
+          <div className="h-7 w-7 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+          <div className="text-center">
+            <p className="text-sm font-medium">{title}</p>
+            <p className="text-xs mt-0.5">{waitingLabel}</p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div className="flex flex-col space-y-6">
@@ -278,7 +312,7 @@ const LiveViewPage = () => {
               <AlertCircle className="h-5 w-5 shrink-0 text-blue-600 mt-0.5" />
               <p className="text-sm font-medium text-blue-900">
                 {isMultiCamera
-                  ? `${stream.multiCameraCount} cameras running the same model • tile 1 is raw stream`
+                  ? `${stream.multiCameraCount} camera${stream.multiCameraCount !== 1 ? "s" : ""} running the same model — raw + inference tile per camera`
                   : `${stream.modelCount} model${stream.modelCount !== 1 ? "s" : ""} running inference • tile 1 is raw stream`}
               </p>
             </div>
@@ -286,7 +320,9 @@ const LiveViewPage = () => {
 
           <div className="flex items-center justify-between">
             <div className="text-sm text-muted-foreground">
-              {stream.sourceType} • {activeSlots} slot{activeSlots !== 1 ? "s" : ""} active
+              {isMultiCamera
+                ? `${stream.sourceType} • ${stream.multiCameraCount} camera${stream.multiCameraCount !== 1 ? "s" : ""} • ${inferenceSlots.length * 2} tiles active`
+                : `${stream.sourceType} • ${activeSlots} slot${activeSlots !== 1 ? "s" : ""} active`}
             </div>
             <button
               onClick={handleStopStream}
@@ -297,49 +333,58 @@ const LiveViewPage = () => {
           </div>
 
           <div className="w-full space-y-4">
-            <div className="space-y-2">
-              <div className="inline-flex items-center rounded-md bg-muted px-3 py-1 text-xs font-semibold text-muted-foreground">
-                Raw Stream
-              </div>
-              <div className="flex justify-start">
-                <div className="h-[40vh] min-h-[260px] w-full max-w-4xl overflow-hidden rounded-lg border border-border">
-                  <GridCell cellNumber={1} src={slotHlsUrl(1)} title="Raw Stream" />
+            {isMultiCamera ? (
+              <>
+                <div className="space-y-2">
+                  <div className="inline-flex items-center rounded-md bg-muted px-3 py-1 text-xs font-semibold text-muted-foreground">
+                    Raw Feeds
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    {inferenceSlots.map((slot) =>
+                      renderTile(`raw-${slot}`, slot, slotRawMjpegUrl(slot), rawTileTitle(slot), "Waiting for camera stream...")
+                    )}
+                  </div>
                 </div>
-              </div>
-            </div>
 
-            {inferenceSlots.length > 0 && (
-              <div className="space-y-2">
-                <div className="inline-flex items-center rounded-md bg-muted px-3 py-1 text-xs font-semibold text-muted-foreground">
-                  {isMultiCamera ? "Camera Inference Grid" : "Model Inference Streams"}
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  {inferenceSlots.map((slot) => (
-                    <div
-                      key={slot}
-                      className="overflow-hidden rounded-lg border border-border"
-                      style={{ height: "35vh", minHeight: "220px" }}
-                    >
-                      {inferenceReady[slot] ? (
-                        <GridCell
-                          cellNumber={slot as 2 | 3 | 4}
-                          src={slotMjpegUrl(slot)}
-                          mode="mjpeg"
-                          title={tileTitle(slot)}
-                        />
-                      ) : (
-                        <div className="flex h-full flex-col items-center justify-center gap-3 bg-muted/30 text-muted-foreground">
-                          <div className="h-7 w-7 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-                          <div className="text-center">
-                            <p className="text-sm font-medium">{tileTitle(slot)}</p>
-                            <p className="text-xs mt-0.5">Waiting for inference stream...</p>
-                          </div>
-                        </div>
+                {inferenceSlots.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="inline-flex items-center rounded-md bg-muted px-3 py-1 text-xs font-semibold text-muted-foreground">
+                      Inference Feeds
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      {inferenceSlots.map((slot) =>
+                        renderTile(`inf-${slot}`, slot, slotMjpegUrl(slot), tileTitle(slot), "Waiting for inference stream...")
                       )}
                     </div>
-                  ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <div className="space-y-2">
+                  <div className="inline-flex items-center rounded-md bg-muted px-3 py-1 text-xs font-semibold text-muted-foreground">
+                    Raw Stream
+                  </div>
+                  <div className="flex justify-start">
+                    <div className="h-[40vh] min-h-[260px] w-full max-w-4xl overflow-hidden rounded-lg border border-border">
+                      <GridCell cellNumber={1} src={slotHlsUrl(1)} title="Raw Stream" />
+                    </div>
+                  </div>
                 </div>
-              </div>
+
+                {inferenceSlots.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="inline-flex items-center rounded-md bg-muted px-3 py-1 text-xs font-semibold text-muted-foreground">
+                      Model Inference Streams
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      {inferenceSlots.map((slot) =>
+                        renderTile(`inf-${slot}`, slot, slotMjpegUrl(slot), tileTitle(slot), "Waiting for inference stream...")
+                      )}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </>

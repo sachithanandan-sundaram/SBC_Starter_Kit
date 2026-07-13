@@ -402,15 +402,17 @@ async def _start_multi_camera_stream(sources: list[str]) -> dict:
         raise HTTPException(400, "Deploy a model before starting a multi-camera stream")
     model = deployed[0]
 
-    # Best-effort raw preview tile for camera 0 (slot 1). This must happen
-    # BEFORE the inference session is started below — it also clears any
-    # previous inference sessions/slots, which would kill our own session if
-    # done afterward.
-    try:
-        await _start_stream_to_mediamtx("RTSP", sources[0])
-        await _wait_for_mediamtx_hls(timeout=15.0)
-    except Exception as e:
-        logger.warning("Raw preview push failed (non-fatal): %s", e)
+    # No MediaMTX raw push here (Phase 3): each camera gets its own raw MJPEG
+    # tile straight from the inference worker's pre-overlay frame (see
+    # ai_inference.FrameHub / get_raw_hub_for_slot, proxied at
+    # /stream/slot/{n}/raw.mjpeg) — a single slot-1 MediaMTX relay would just
+    # be a redundant ffmpeg process feeding a ~16s-latency tile nobody looks
+    # at anymore. Still tear down slot 1 if a previous legacy single-camera
+    # session left it running, and clear any previous inference session —
+    # both must happen BEFORE the new inference session is started below.
+    if _slots[1].running:
+        _stop_slot(1)
+    await _cleanup_inference_slots()
 
     state.set_source("RTSP", sources[0])
 
@@ -600,21 +602,12 @@ async def get_slot_playlist(slot: int):
     return await get_slot_asset(slot, "index.m3u8")
 
 
-# Registered before the generic {asset_name} catch-all below so "mjpeg"
-# doesn't fall through to the HLS-asset handler (which would reject it —
-# .m3u8/.ts/.mp4 only).
-@router.get("/stream/slot/{slot}/mjpeg")
-async def get_slot_mjpeg(slot: int):
-    """Streaming proxy for the AI service's MJPEG live view (Phase 2 —
-    near-real-time inference display, bypassing HLS entirely). Must not
+async def _proxy_mjpeg(upstream_path: str) -> StreamingResponse:
+    """Streaming proxy for one of the AI service's MJPEG endpoints. Must not
     buffer the whole response: this is a live, effectively-infinite stream."""
-    if slot == 1:
-        raise HTTPException(400, "MJPEG live view is only available for inference slots (2-5)")
-    _validate_slot(slot)
-
     client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=None))
     try:
-        req = client.build_request("GET", f"{VOYAGER_BASE}/inference/stream/{slot}")
+        req = client.build_request("GET", f"{VOYAGER_BASE}{upstream_path}")
         upstream = await client.send(req, stream=True)
     except httpx.RequestError as e:
         await client.aclose()
@@ -643,6 +636,28 @@ async def get_slot_mjpeg(slot: int):
             "Access-Control-Allow-Origin": "*",
         },
     )
+
+
+# Registered before the generic {asset_name} catch-all below so "mjpeg" /
+# "raw.mjpeg" don't fall through to the HLS-asset handler (which would
+# reject them — .m3u8/.ts/.mp4 only).
+@router.get("/stream/slot/{slot}/mjpeg")
+async def get_slot_mjpeg(slot: int):
+    """Phase 2 — near-real-time annotated inference display, bypassing HLS."""
+    if slot == 1:
+        raise HTTPException(400, "MJPEG live view is only available for inference slots (2-5)")
+    _validate_slot(slot)
+    return await _proxy_mjpeg(f"/inference/stream/{slot}")
+
+
+@router.get("/stream/slot/{slot}/raw.mjpeg")
+async def get_slot_raw_mjpeg(slot: int):
+    """Phase 3 — per-camera raw (pre-overlay) tile, same latency/pipeline as
+    the annotated MJPEG above, captured before draw_overlays_bgr runs."""
+    if slot == 1:
+        raise HTTPException(400, "Raw MJPEG is served per-camera on inference slots (2-5), not slot 1")
+    _validate_slot(slot)
+    return await _proxy_mjpeg(f"/inference/raw/{slot}")
 
 
 # FIX: api_route with GET + HEAD so nginx doesn't 405 HEAD requests
