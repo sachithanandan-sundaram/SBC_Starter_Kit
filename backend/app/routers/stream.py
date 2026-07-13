@@ -24,7 +24,7 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, File, HTTPException, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.config import settings
@@ -598,6 +598,51 @@ async def get_slot1_asset(asset_path: str):
 @router.get("/stream/slot/{slot}/index.m3u8")
 async def get_slot_playlist(slot: int):
     return await get_slot_asset(slot, "index.m3u8")
+
+
+# Registered before the generic {asset_name} catch-all below so "mjpeg"
+# doesn't fall through to the HLS-asset handler (which would reject it —
+# .m3u8/.ts/.mp4 only).
+@router.get("/stream/slot/{slot}/mjpeg")
+async def get_slot_mjpeg(slot: int):
+    """Streaming proxy for the AI service's MJPEG live view (Phase 2 —
+    near-real-time inference display, bypassing HLS entirely). Must not
+    buffer the whole response: this is a live, effectively-infinite stream."""
+    if slot == 1:
+        raise HTTPException(400, "MJPEG live view is only available for inference slots (2-5)")
+    _validate_slot(slot)
+
+    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=None))
+    try:
+        req = client.build_request("GET", f"{VOYAGER_BASE}/inference/stream/{slot}")
+        upstream = await client.send(req, stream=True)
+    except httpx.RequestError as e:
+        await client.aclose()
+        raise HTTPException(503, f"voyager-sdk unreachable: {e}")
+
+    if upstream.status_code != 200:
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(upstream.status_code, f"voyager-sdk mjpeg error: {upstream.status_code}")
+
+    content_type = upstream.headers.get("content-type", "multipart/x-mixed-replace; boundary=frame")
+
+    async def _proxy():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        _proxy(),
+        media_type=content_type,
+        headers={
+            "Cache-Control": "no-store, no-cache",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 # FIX: api_route with GET + HEAD so nginx doesn't 405 HEAD requests

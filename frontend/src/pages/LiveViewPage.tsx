@@ -64,6 +64,14 @@ const LiveViewPage = () => {
     return `/api/stream/slot/${slot}/index.m3u8${fragment}`;
   };
 
+  // Inference tiles use MJPEG (near-real-time, ~1 frame latency) instead of
+  // HLS (~16s: encode -> segment -> player buffer). HLS is still produced
+  // under the hood for recording — this only changes what's displayed live.
+  const slotMjpegUrl = (slot: number): string => {
+    const fragment = stream.sessionToken ? `#${stream.sessionToken}` : "";
+    return `/api/stream/slot/${slot}/mjpeg${fragment}`;
+  };
+
   const handleStartStream = async () => {
     let sourceType: SourceType | null = null;
     let sourceValue: string | null = null;
@@ -315,7 +323,8 @@ const LiveViewPage = () => {
                       {inferenceReady[slot] ? (
                         <GridCell
                           cellNumber={slot as 2 | 3 | 4}
-                          src={slotHlsUrl(slot)}
+                          src={slotMjpegUrl(slot)}
+                          mode="mjpeg"
                           title={tileTitle(slot)}
                         />
                       ) : (

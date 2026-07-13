@@ -30,7 +30,7 @@ import subprocess
 import shutil
 from multiprocessing import Process, Queue, Value, Event
 from pathlib import Path
-from queue import Empty, Full
+from queue import Empty, Full, Queue as ThreadQueue
 
 HLS_ROOT      = os.getenv("HLS_ROOT", "/tmp/hls")
 HLS_TIME      = 1
@@ -275,6 +275,67 @@ class HLSWriter:
             pass
 
 
+# ── Frame hub (fan-out for MJPEG live view) ───────────────────────────────────
+#
+# The inference child process writes annotated JPEGs into one multiprocessing
+# Queue per source. HLSWriter used to `.get()` directly from that queue — fine
+# when it was the only consumer, but Queue.get() is destructive: a second
+# consumer (an MJPEG viewer) would steal every other frame instead of seeing
+# every frame HLSWriter sees. FrameHub drains the mp Queue once and republishes
+# each JPEG to HLSWriter's own in-process queue plus any number of live MJPEG
+# subscriber queues, so recording (Phase 1) and low-latency live view (this
+# phase) both get every frame independently.
+
+class FrameHub:
+    def __init__(self, mp_frame_queue: Queue):
+        self.mp_frame_queue = mp_frame_queue
+        self.hls_queue: ThreadQueue = ThreadQueue(maxsize=30)
+        self._subscribers: list[ThreadQueue] = []
+        self._sub_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="frame-hub")
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                jpeg = self.mp_frame_queue.get(timeout=1.0)
+            except Empty:
+                continue
+            push_frame(self.hls_queue, jpeg)
+            with self._sub_lock:
+                subs = list(self._subscribers)
+            for q in subs:
+                push_frame(q, jpeg)
+
+    def subscribe(self) -> ThreadQueue:
+        # Small buffer — an MJPEG viewer only ever wants the latest frame;
+        # push_frame() already drops the oldest one when full.
+        q: ThreadQueue = ThreadQueue(maxsize=5)
+        with self._sub_lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: ThreadQueue) -> None:
+        with self._sub_lock:
+            if q in self._subscribers:
+                self._subscribers.remove(q)
+
+    def stop(self):
+        self._stop.set()
+
+
+def get_hub_for_slot(slot_id: int) -> "FrameHub | None":
+    for session in SESSIONS.values():
+        for i, w in enumerate(session.get("writers", [])):
+            if w.slot_id == slot_id:
+                hubs = session.get("hubs", [])
+                return hubs[i] if i < len(hubs) else None
+    return None
+
+
 # ── Inference worker ──────────────────────────────────────────────────────────
 
 def inference_worker(run_id: str, network_yaml: str, sources: list,
@@ -426,16 +487,21 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
         except OSError:
             time.sleep(0.05)
 
+    hubs    = []
     writers = []
     for i in range(len(sources)):
-        w = HLSWriter(f"{run_id}-s{i}", base_slot + i, frame_queues[i])
+        hub = FrameHub(frame_queues[i])
+        hub.start()
+        w = HLSWriter(f"{run_id}-s{i}", base_slot + i, hub.hls_queue)
         w.start()
+        hubs.append(hub)
         writers.append(w)
 
     SESSIONS[run_id] = {
         "process":     process,
         "pgid":        pgid,
         "writers":     writers,
+        "hubs":        hubs,
         "stop_event":  stop_event,
         "base_slot":   base_slot,
         "source_type": source_type,
@@ -531,6 +597,8 @@ def stop_session(run_id: str) -> bool:
 
     for w in session.get("writers", []):
         w.stop()
+    for hub in session.get("hubs", []):
+        hub.stop()
 
     logger.info("[%s] session stopped", run_id)
     return True

@@ -10,6 +10,7 @@ Endpoints:
   POST /inference/start
   POST /inference/stop
   GET  /inference/status
+  GET  /inference/stream/{slot}   MJPEG live view (multipart/x-mixed-replace)
   GET  /hls/slot-{n}/index.m3u8
   GET  /hls/slot-{n}/{segment}
   POST /models/upload-weights
@@ -31,13 +32,14 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ai_inference import (
     start_session,
     stop_session,
     get_status,
+    get_hub_for_slot,
     shutdown_handler,
     SESSIONS,
 )
@@ -351,6 +353,55 @@ def inference_stop(request: InferenceStopRequest):
 @app.get("/inference/status")
 def inference_status():
     return {"sessions": get_status()}
+
+
+# ── MJPEG live view ────────────────────────────────────────────────────────────
+#
+# HLSWriter (kept running for recording — see recordings.py) is inherently
+# high-latency: encode to H.264, segment to disk, wait for the HLS player to
+# have enough segments buffered. The inference worker already has the
+# annotated JPEG for every frame sitting in a queue — serve those directly as
+# multipart/x-mixed-replace instead, which an <img> tag "just works" with.
+# Latency drops to about one frame + network, since there's no segmenting or
+# re-encode at all. Bandwidth is higher than H.264 (JPEG per frame,
+# uncompressed relative to inter-frame coding) — fine at 8fps/720p on a LAN;
+# if it's heavy with 4 cameras, lower HLS_QUALITY or _target_fps() in
+# ai_inference.py rather than reaching for --frame-rate (crashes mppvideodec).
+
+MJPEG_BOUNDARY = "frame"
+
+
+@app.get("/inference/stream/{slot}")
+def inference_mjpeg_stream(slot: int):
+    hub = get_hub_for_slot(slot)
+    if hub is None:
+        raise HTTPException(404, f"No active inference stream for slot {slot}")
+
+    def _gen():
+        q = hub.subscribe()
+        try:
+            while True:
+                try:
+                    jpeg = q.get(timeout=10)
+                except queue.Empty:
+                    # No frame for 10s — stream stalled or client gone; end
+                    # the generator so the connection closes instead of
+                    # hanging forever.
+                    break
+                yield (
+                    b"--" + MJPEG_BOUNDARY.encode() + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                    + jpeg + b"\r\n"
+                )
+        finally:
+            hub.unsubscribe(q)
+
+    return StreamingResponse(
+        _gen(),
+        media_type=f"multipart/x-mixed-replace; boundary={MJPEG_BOUNDARY}",
+        headers={"Cache-Control": "no-store, no-cache"},
+    )
 
 
 # ── HLS file serving ──────────────────────────────────────────────────────────
