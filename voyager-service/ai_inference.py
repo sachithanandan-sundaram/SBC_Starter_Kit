@@ -472,7 +472,7 @@ def inference_worker(run_id: str, network_yaml: str, sources: list,
                             qdepth = -1  # qsize() unsupported on some platforms
                         ts = _probe_frame_timestamp(fr)
                         age_str = f"{now - ts:.1f}s" if ts is not None else "n/a"
-                        logger.info(
+                        logger.debug(
                             "[%s] DIAG src=%d arrival_fps=%.1f drops_last_window=%d qdepth=%s frame_age=%s",
                             run_id, sid, fps, st["drops"], qdepth, age_str,
                         )
