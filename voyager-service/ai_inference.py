@@ -151,9 +151,15 @@ def encode_jpeg(frame, quality=HLS_QUALITY):
     return buf.tobytes() if ok else None
 
 
-def push_frame(q: Queue, jpeg: bytes):
+def push_frame(q: Queue, jpeg: bytes) -> bool:
+    """Push a frame, dropping the oldest queued one if full so the queue
+    always holds the newest frame available. Returns True if a drop occurred
+    (queue was full) — callers may track this to confirm the drop-oldest
+    path is actually engaging, existing callers that ignore it are
+    unaffected."""
     try:
         q.put_nowait(jpeg)
+        return False
     except Full:
         try:
             q.get_nowait()
@@ -163,6 +169,36 @@ def push_frame(q: Queue, jpeg: bytes):
             q.put_nowait(jpeg)
         except Full:
             pass
+        return True
+
+
+def _probe_frame_timestamp(fr) -> "float | None":
+    """Best-effort: some SDK frame/meta objects carry a capture/production
+    timestamp. If found, `now - timestamp` is the most direct evidence of
+    where multi-camera latency lives — inter-arrival rate alone can't tell
+    "throttled but fresh" from "throttled because stale", since both look
+    identical from our loop's iteration rate (see
+    CLAUDE_CODE_FIX_MULTICAM_LATENCY.md). Returns None if no recognizable
+    timestamp field is found (nothing further to instrument without SDK
+    source access)."""
+    candidates = []
+    for attr in ("timestamp", "pts", "capture_time", "ts"):
+        candidates.append(getattr(fr, attr, None))
+    meta = getattr(fr, "meta", None)
+    if meta is not None:
+        for attr in ("timestamp", "pts", "capture_time", "ts"):
+            candidates.append(getattr(meta, attr, None))
+    for val in candidates:
+        if not isinstance(val, (int, float)) or val <= 0:
+            continue
+        # GStreamer PTS/DTS are usually relative nanoseconds since pipeline
+        # start, not wall-clock epoch — those fail this plausible-range
+        # check and get skipped rather than reported as a nonsense age.
+        if 1_600_000_000 < val < 4_000_000_000:          # epoch seconds
+            return float(val)
+        if 1_600_000_000_000 < val < 4_000_000_000_000:  # epoch milliseconds
+            return float(val) / 1000.0
+    return None
 
 
 # ── HLS Writer ────────────────────────────────────────────────────────────────
@@ -369,6 +405,16 @@ def inference_worker(run_id: str, network_yaml: str, sources: list,
         total_frames   = 0
         logged_sources = 0  # bring-up aid: log fr.source_id for the first ~20 frames
 
+        # Diagnostic instrumentation (CLAUDE_CODE_FIX_MULTICAM_LATENCY.md):
+        # per-source arrival rate, queue-drop counts, and (if the SDK exposes
+        # one) frame staleness, logged every ~5s per source. Determines
+        # whether the multi-camera lag is reachable from our own code (which
+        # would show up as frames arriving quickly and piling up before a
+        # drop-oldest queue starts shedding) or is baked in before frames
+        # ever reach this loop (arrival rate throttled to the AIPU's output
+        # rate regardless of how stale the content already is).
+        _arrival_stats: dict = {}
+
         while not stop_event.is_set():
             stream = None
             try:
@@ -396,11 +442,33 @@ def inference_worker(run_id: str, network_yaml: str, sources: list,
                     if sid >= len(frame_queues):
                         continue
 
+                    now = time.time()
+                    st = _arrival_stats.setdefault(sid, {"window_start": now, "count": 0, "drops": 0})
+                    st["count"] += 1
+
                     frame = fr.image.asarray('BGR').copy()
                     frame, _, _ = wginference.draw_overlays_bgr(frame, fr.meta)
                     jpeg = encode_jpeg(frame)
                     if jpeg:
-                        push_frame(frame_queues[sid], jpeg)
+                        if push_frame(frame_queues[sid], jpeg):
+                            st["drops"] += 1
+
+                    window_elapsed = now - st["window_start"]
+                    if window_elapsed >= 5.0:
+                        fps = st["count"] / window_elapsed
+                        try:
+                            qdepth = frame_queues[sid].qsize()
+                        except Exception:
+                            qdepth = -1  # qsize() unsupported on some platforms
+                        ts = _probe_frame_timestamp(fr)
+                        age_str = f"{now - ts:.1f}s" if ts is not None else "n/a"
+                        logger.info(
+                            "[%s] DIAG src=%d arrival_fps=%.1f drops_last_window=%d qdepth=%s frame_age=%s",
+                            run_id, sid, fps, st["drops"], qdepth, age_str,
+                        )
+                        st["window_start"] = now
+                        st["count"] = 0
+                        st["drops"] = 0
 
                     total_frames += 1
                     if total_frames % 200 == 0:
