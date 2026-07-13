@@ -18,6 +18,7 @@ Endpoints:
   POST /models/upload-dataset
 """
 
+import asyncio
 import json
 import os
 import re
@@ -334,20 +335,16 @@ def inference_start(request: InferenceStartRequest):
 
 @app.post("/inference/stop")
 def inference_stop(request: InferenceStopRequest):
+    # stop_session() already scopes teardown to THIS session's pgid (a
+    # graceful stop_event-driven exit first, so the SDK's own finally block
+    # releases the AIPU device cleanly, falling back to os.killpg only if it
+    # doesn't exit in time). A blanket `pkill -9 -f wginference` used to run
+    # here unconditionally afterward — it would kill every OTHER active
+    # session's worker too (e.g. concurrent per-model sessions in the
+    # single-camera/multi-model flow), which is exactly what stop_session's
+    # own pgid-scoped kill is designed to avoid. Removed.
     if not stop_session(request.run_id):
         raise HTTPException(404, f"Session {request.run_id} not found")
-
-    # Force-kill any lingering wginference processes to release AIPU cores
-    try:
-        subprocess.run(
-            ["pkill", "-9", "-f", "wginference"],
-            timeout=3, capture_output=True
-        )
-    except Exception:
-        pass
-
-    # Give the AIPU driver a moment to release resources
-    time.sleep(1)
 
     return {"status": "stopped", "run_id": request.run_id}
 
@@ -370,21 +367,39 @@ def inference_status():
 # if it's heavy with 4 cameras, lower HLS_QUALITY or _target_fps() in
 # ai_inference.py rather than reaching for --frame-rate (crashes mppvideodec).
 
-MJPEG_BOUNDARY = "frame"
+MJPEG_BOUNDARY   = "frame"
+MJPEG_POLL_SECS  = 1.0    # how often the generator yields control back to asyncio
+MJPEG_IDLE_LIMIT = 10.0   # give up if the hub itself has produced nothing this long
 
 
 def _mjpeg_response(hub) -> StreamingResponse:
-    def _gen():
+    # Must be a genuine async generator, NOT a sync generator run in a
+    # threadpool. A sync generator blocked in q.get() cannot be interrupted
+    # by asyncio task cancellation — Starlette can only stop *awaiting* it,
+    # not actually unblock the underlying thread — so when a browser
+    # disconnects (tab closed, <img> remounted by MjpegPlayer's retry-on-
+    # error), the thread just keeps blocking on q.get(), which keeps
+    # returning real frames every ~125ms forever, so the 10s "idle" timeout
+    # below never fires either. That leaks one FrameHub subscriber (and one
+    # threadpool worker) PER abandoned connection, permanently: FrameHub's
+    # per-frame fan-out loop gets slower as the zombie list grows, which
+    # backs up frame_queues, which is exactly the mechanism that causes
+    # camera-to-screen latency to climb over a session's lifetime. Polling
+    # with `await asyncio.to_thread(...)` yields control back to the event
+    # loop every MJPEG_POLL_SECS, so a real client disconnect is noticed and
+    # cancels this generator (running hub.unsubscribe(q) in the finally)
+    # within about a second, regardless of whether frames keep flowing.
+    async def _gen():
         q = hub.subscribe()
+        idle = 0.0
         try:
-            while True:
+            while idle < MJPEG_IDLE_LIMIT:
                 try:
-                    jpeg = q.get(timeout=10)
+                    jpeg = await asyncio.to_thread(q.get, True, MJPEG_POLL_SECS)
+                    idle = 0.0
                 except queue.Empty:
-                    # No frame for 10s — stream stalled or client gone; end
-                    # the generator so the connection closes instead of
-                    # hanging forever.
-                    break
+                    idle += MJPEG_POLL_SECS
+                    continue
                 yield (
                     b"--" + MJPEG_BOUNDARY.encode() + b"\r\n"
                     b"Content-Type: image/jpeg\r\n"
@@ -402,7 +417,7 @@ def _mjpeg_response(hub) -> StreamingResponse:
 
 
 @app.get("/inference/stream/{slot}")
-def inference_mjpeg_stream(slot: int):
+async def inference_mjpeg_stream(slot: int):
     hub = get_hub_for_slot(slot)
     if hub is None:
         raise HTTPException(404, f"No active inference stream for slot {slot}")
@@ -410,7 +425,7 @@ def inference_mjpeg_stream(slot: int):
 
 
 @app.get("/inference/raw/{slot}")
-def raw_mjpeg_stream(slot: int):
+async def raw_mjpeg_stream(slot: int):
     """Phase 3: per-camera raw (pre-overlay) MJPEG, captured from the same
     frame before draw_overlays_bgr runs — no extra ffmpeg process, and stays
     frame-synced with the annotated tile since both come from the same

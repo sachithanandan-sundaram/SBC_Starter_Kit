@@ -295,7 +295,14 @@ async def _cleanup_inference_slots() -> None:
     # /stream/status stops reporting a dead session.
     _clear_multi_camera_session()
 
-    # Stop all voyager inference sessions
+    # Stop all voyager inference sessions. stop_session() on the voyager side
+    # now waits for a graceful stop_event-driven exit (up to ~6s) before
+    # falling back to a forced kill, specifically so the SDK's own cleanup
+    # releases the AIPU device cleanly — worst case that's ~12-13s per
+    # session. A short timeout here would abandon the request client-side
+    # while voyager keeps tearing down anyway, silently swallowed by the
+    # broad except below, which previously masked exactly this kind of
+    # timeout instead of surfacing it.
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(f"{VOYAGER_BASE}/inference/status")
@@ -306,10 +313,10 @@ async def _cleanup_inference_slots() -> None:
                         await client.post(
                             f"{VOYAGER_BASE}/inference/stop",
                             json={"run_id": s["run_id"]},
-                            timeout=5
+                            timeout=20,
                         )
                     except Exception as e:
-                        logger.debug("Could not stop voyager session %s: %s", s.get("run_id"), e)
+                        logger.warning("Could not stop voyager session %s: %s", s.get("run_id"), e)
                 if sessions:
                     logger.info("Stopped %d voyager inference session(s)", len(sessions))
     except Exception as e:

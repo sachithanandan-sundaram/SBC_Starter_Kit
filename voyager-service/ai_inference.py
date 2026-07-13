@@ -391,9 +391,10 @@ class HLSWriter:
 # plus any number of live MJPEG subscriber queues.
 
 class FrameHub:
-    def __init__(self, mp_frame_queue: Queue, with_hls_queue: bool = True):
+    def __init__(self, mp_frame_queue: Queue, with_hls_queue: bool = True, label: str = ""):
         self.mp_frame_queue = mp_frame_queue
         self.hls_queue: "ThreadQueue | None" = ThreadQueue(maxsize=30) if with_hls_queue else None
+        self.label = label
         self._subscribers: list[ThreadQueue] = []
         self._sub_lock = threading.Lock()
         self._stop = threading.Event()
@@ -403,6 +404,14 @@ class FrameHub:
         self._thread.start()
 
     def _run(self):
+        # DIAG (CLAUDE_CODE_FIX_STOP_AND_LATENCY.md): subscriber count is the
+        # direct signal for the "MJPEG viewer never disconnects server-side"
+        # leak class — each abandoned browser connection that isn't properly
+        # unsubscribed adds one more iteration to the per-frame fan-out below
+        # forever, which is exactly the kind of thing that degrades frame
+        # throughput gradually rather than all at once. Logged at debug level
+        # every ~5s so it doesn't flood the log at info level.
+        last_diag = time.time()
         while not self._stop.is_set():
             try:
                 jpeg = self.mp_frame_queue.get(timeout=1.0)
@@ -414,6 +423,15 @@ class FrameHub:
                 subs = list(self._subscribers)
             for q in subs:
                 push_frame(q, jpeg)
+
+            now = time.time()
+            if now - last_diag >= 5.0:
+                try:
+                    qdepth = self.mp_frame_queue.qsize()
+                except Exception:
+                    qdepth = -1
+                logger.debug("[hub:%s] subscribers=%d mp_qdepth=%s", self.label, len(subs), qdepth)
+                last_diag = now
 
     def subscribe(self) -> ThreadQueue:
         # Small buffer — an MJPEG viewer only ever wants the latest frame;
@@ -749,14 +767,15 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
     raw_hubs = []
     writers  = []
     for i in range(len(sources)):
-        hub = FrameHub(frame_queues[i])
+        slot = base_slot + i
+        hub = FrameHub(frame_queues[i], label=f"{run_id}-slot{slot}-inf")
         hub.start()
-        w = HLSWriter(f"{run_id}-s{i}", base_slot + i, hub.hls_queue)
+        w = HLSWriter(f"{run_id}-s{i}", slot, hub.hls_queue)
         w.start()
         hubs.append(hub)
         writers.append(w)
 
-        raw_hub = FrameHub(raw_frame_queues[i], with_hls_queue=False)
+        raw_hub = FrameHub(raw_frame_queues[i], with_hls_queue=False, label=f"{run_id}-slot{slot}-raw")
         raw_hub.start()
         raw_hubs.append(raw_hub)
 
@@ -785,6 +804,17 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
                 time.sleep(3)
                 if stop_event.is_set():
                     break
+                # Re-check right before actually spawning, and again right
+                # after: stop_session() may have run during the 3s settle
+                # sleep above. Starting a process here that stop_session()
+                # already finished tearing down would leave it completely
+                # untracked (no SESSIONS entry, no pgid anywhere) — invisible
+                # to /inference/status and unkillable except by finding it
+                # by hand, which is exactly the kind of orphan that stacks
+                # up across repeated stop/start cycles and competes for the
+                # AIPU forever.
+                if stop_event.is_set() or run_id not in SESSIONS:
+                    break
                 try:
                     new_proc = Process(
                         target=inference_worker,
@@ -792,7 +822,24 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
                               raw_frame_queues, source_status, stop_event),
                         daemon=False,
                     )
+                    if stop_event.is_set() or run_id not in SESSIONS:
+                        break
                     new_proc.start()
+                    if stop_event.is_set() or run_id not in SESSIONS:
+                        # Stop landed while we were spawning — this process
+                        # is now our responsibility to clean up since no
+                        # SESSIONS entry will ever reference it.
+                        logger.warning("[%s] stop requested mid-restart — killing orphaned pid=%d",
+                                       run_id, new_proc.pid)
+                        try:
+                            os.setpgid(new_proc.pid, new_proc.pid)
+                            os.killpg(new_proc.pid, signal.SIGKILL)
+                        except Exception:
+                            try:
+                                new_proc.kill()
+                            except Exception:
+                                pass
+                        break
                     new_pgid = None
                     for _ in range(10):
                         try:
@@ -831,29 +878,50 @@ def stop_session(run_id: str) -> bool:
     proc = session["process"]
     pgid = session.get("pgid")
 
+    # Graceful first: inference_worker ignores SIGINT/SIGTERM on purpose (so
+    # a Ctrl+C aimed at the whole stack doesn't kill it prematurely) — the
+    # ONLY cooperative way to stop it is stop_event, which its own loop
+    # checks per-frame and, on the way out, runs `stream.stop()` in a
+    # finally block. That's what asks the SDK to release the AIPU device
+    # cleanly. Jumping straight to SIGKILL (as this used to) skips that
+    # finally block entirely — SIGKILL can't be caught or deferred — so the
+    # driver never sees a clean release: "Failed to detach ... Device or
+    # resource busy" on the next session's init, and the old process either
+    # lingers or leaves the device in a bad state instead of actually dying.
+    # Frames arrive at least every second or so in the healthy case, so the
+    # loop should notice stop_event and exit well within this window.
+    proc.join(timeout=6)
+
     if proc.is_alive():
-        # Kill entire process group using stored pgid
+        logger.warning("[%s] did not exit gracefully within 6s — force-killing "
+                        "(AIPU device may not release cleanly)", run_id)
         if pgid:
             try:
                 os.killpg(pgid, signal.SIGKILL)
                 logger.info("[%s] killed process group %d", run_id, pgid)
             except Exception as e:
                 logger.warning("[%s] killpg failed: %s", run_id, e)
-        # Also direct kill as fallback
         try:
             proc.kill()
         except Exception:
             pass
         proc.join(timeout=3)
 
+    if proc.is_alive():
+        logger.error("[%s] process %d still alive after SIGKILL — this should not happen",
+                     run_id, proc.pid)
+    else:
+        logger.info("[%s] worker process exited (pid=%s, exitcode=%s)",
+                    run_id, proc.pid, proc.exitcode)
+
     # Small pause to let the process fully exit before cleanup
     time.sleep(0.5)
 
-    # Kill only wginference children of THIS session's process group
-    # DO NOT pkill -9 all wginference — that kills other active sessions
+    # Sweep any leftover processes in our group (e.g. a probe subprocess that
+    # was mid-flight). Scoped to THIS session's pgid — do NOT pkill -9 all
+    # wginference, that would kill other active sessions.
     if pgid:
         try:
-            # Kill any remaining processes in our group
             os.killpg(pgid, signal.SIGKILL)
         except Exception:
             pass

@@ -276,9 +276,11 @@ async def remove_model(slot: int):
     stream_slot = slot + 1          # model slot 1 → stream slot 2
     run_id      = f"{model_id}-slot{stream_slot}"
 
-    # Stop voyager-sdk inference session
+    # Stop voyager-sdk inference session. stop_session() there waits for a
+    # graceful stop_event-driven exit (so the SDK releases the AIPU device
+    # cleanly) before forcing — worst case ~12-13s, hence the longer timeout.
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
+        async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
                 f"{VOYAGER_BASE}/inference/stop",
                 json={"run_id": run_id},
