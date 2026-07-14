@@ -102,6 +102,60 @@ def _clear_multi_camera_session() -> None:
     })
 
 
+async def _reconcile_multi_camera_session() -> None:
+    """
+    Called once on backend startup. _multi_camera_session lives only in this
+    process's memory, so a backend restart while a multi-camera inference
+    session is still running on voyager-sdk (a separate container — it keeps
+    running independently) wipes all knowledge of it here: `active` resets
+    to False, and /stream/status stops reporting the session at all, even
+    though voyager is still happily processing frames. Two consequences:
+    the frontend can't restore the grid across a refresh (session.active is
+    false), and Stop Stream falls back to the status-independent enumerate
+    path in _cleanup_inference_slots instead of the direct/tracked one. The
+    enumerate fallback already means Stop still works either way, but
+    status reporting doesn't — so rebuild _multi_camera_session from
+    voyager's own live truth instead of just tolerating the gap.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"{VOYAGER_BASE}/inference/status")
+        if resp.status_code != 200:
+            return
+        sessions = resp.json().get("sessions", [])
+    except Exception as e:
+        logger.debug("Could not reconcile multi-camera session on startup: %s", e)
+        return
+
+    # run_id is always f"multicam-{model_id}" for this flow (see
+    # _start_multi_camera_stream) — nothing else produces that prefix.
+    multicam_sessions = [s for s in sessions if str(s.get("run_id", "")).startswith("multicam-")]
+    if not multicam_sessions:
+        return
+    if len(multicam_sessions) > 1:
+        logger.warning("Found %d orphaned multi-camera sessions on startup — adopting "
+                        "the first; the others won't be tracked or stoppable via the "
+                        "direct path (the enumerate fallback in _cleanup_inference_slots "
+                        "still reaches them)", len(multicam_sessions))
+
+    s = multicam_sessions[0]
+    slots   = sorted(s.get("slots") or [])
+    sources = s.get("sources") or []
+    if not slots or not sources:
+        return
+
+    _multi_camera_session.update({
+        "active":          True,
+        "source_type":     "RTSP",
+        "sources":         sources,
+        "inference_slots": slots,
+        "raw_slot":        1,
+        "run_id":          s["run_id"],
+    })
+    logger.info("Reconciled orphaned multi-camera session on startup: run_id=%s slots=%s",
+                s["run_id"], slots)
+
+
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class StreamStartRequest(BaseModel):

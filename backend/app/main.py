@@ -67,6 +67,7 @@ async def lifespan(_: FastAPI):
         logger.info("Bootstrapped default model to %s", target_model)
 
     await _sync_models_from_voyager()
+    await stream._reconcile_multi_camera_session()
     yield
     # Clean up persistent HTTP clients
     await stream._close_mediamtx_client()
