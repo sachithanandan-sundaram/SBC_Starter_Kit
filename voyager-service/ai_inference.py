@@ -543,15 +543,23 @@ def inference_worker(run_id: str, network_yaml: str, sources: list, base_slot: i
 
         threading.Thread(target=_source_watcher, daemon=True, name=f"src-watch-{run_id}").start()
 
-        # Diagnostic instrumentation (CLAUDE_CODE_FIX_MULTICAM_LATENCY.md):
-        # per-source arrival rate, queue-drop counts, and (if the SDK exposes
-        # one) frame staleness, logged every ~5s per source. Determines
-        # whether the multi-camera lag is reachable from our own code (which
-        # would show up as frames arriving quickly and piling up before a
-        # drop-oldest queue starts shedding) or is baked in before frames
-        # ever reach this loop (arrival rate throttled to the AIPU's output
-        # rate regardless of how stale the content already is).
+        # Diagnostic instrumentation (CLAUDE_CODE_FIX_MULTICAM_LATENCY.md,
+        # extended per CLAUDE_CODE_FIX_STOP_AND_LATENCY.md): per-source
+        # arrival rate, queue-drop counts, per-stage timing, and (if the SDK
+        # exposes one) frame staleness, logged every ~5s per source — plus
+        # an aggregate loop_fps below. Determines whether latency growth is
+        # reachable from our own code (this loop falling behind the combined
+        # camera arrival rate, so it deficit-spends into a backlog somewhere
+        # upstream) or something else entirely (e.g. FrameHub subscriber
+        # accumulation — see the per-hub subscriber/qdepth log in FrameHub).
         _arrival_stats: dict = {}
+        # Aggregate loop iteration rate across ALL sources combined — the
+        # number to compare directly against total camera supply (e.g. ~33fps
+        # for 3 cams at ~11fps each). If this is below supply, the deficit is
+        # somewhere in THIS loop's own per-frame work (timed below); if it
+        # keeps pace, the backlog is elsewhere (e.g. FrameHub fan-out, or
+        # upstream in the SDK/GStreamer).
+        _loop_stats = {"window_start": time.time(), "count": 0}
 
         while not stop_event.is_set():
             stream = None
@@ -601,6 +609,18 @@ def inference_worker(run_id: str, network_yaml: str, sources: list, base_slot: i
                     if fr is None or fr.image is None:
                         continue
 
+                    # Aggregate loop rate — every frame this loop actually
+                    # receives from the SDK, across all sources combined,
+                    # regardless of what happens to it afterward.
+                    _loop_stats["count"] += 1
+                    loop_wall_now = time.time()
+                    loop_elapsed = loop_wall_now - _loop_stats["window_start"]
+                    if loop_elapsed >= 5.0:
+                        logger.debug("[%s] DIAG loop_fps=%.1f (aggregate, all sources)",
+                                     run_id, _loop_stats["count"] / loop_elapsed)
+                        _loop_stats["window_start"] = loop_wall_now
+                        _loop_stats["count"] = 0
+
                     active_sid = getattr(fr, "source_id", 0) or 0
                     if logged_sources < 20:
                         logger.info("[%s] frame source_id=%s", run_id, active_sid)
@@ -612,41 +632,79 @@ def inference_worker(run_id: str, network_yaml: str, sources: list, base_slot: i
                         continue
 
                     now = time.time()
-                    st = _arrival_stats.setdefault(sid, {"window_start": now, "count": 0, "drops": 0})
+                    st = _arrival_stats.setdefault(sid, {
+                        "window_start": now, "count": 0, "drops": 0, "raw_drops": 0,
+                        "t_asarray": 0.0, "t_raw_encode": 0.0, "t_raw_push": 0.0,
+                        "t_overlay": 0.0, "t_ann_encode": 0.0, "t_ann_push": 0.0,
+                    })
                     st["count"] += 1
 
+                    t0 = time.perf_counter()
                     frame = fr.image.asarray('BGR').copy()
+                    t1 = time.perf_counter()
+                    st["t_asarray"] += t1 - t0
 
                     # Snapshot the raw (pre-overlay) frame BEFORE draw_overlays_bgr
                     # runs — it draws directly onto `frame` in place and returns
                     # that same array, so this must happen first or the "raw"
                     # JPEG would already have boxes on it.
                     raw_jpeg = encode_jpeg(frame)
+                    t2 = time.perf_counter()
+                    st["t_raw_encode"] += t2 - t1
                     if raw_jpeg and sid < len(raw_frame_queues):
-                        push_frame(raw_frame_queues[sid], raw_jpeg)
+                        if push_frame(raw_frame_queues[sid], raw_jpeg):
+                            st["raw_drops"] += 1
+                    t3 = time.perf_counter()
+                    st["t_raw_push"] += t3 - t2
 
                     frame, _, _ = wginference.draw_overlays_bgr(frame, fr.meta)
+                    t4 = time.perf_counter()
+                    st["t_overlay"] += t4 - t3
+
                     jpeg = encode_jpeg(frame)
+                    t5 = time.perf_counter()
+                    st["t_ann_encode"] += t5 - t4
+
                     if jpeg:
                         if push_frame(frame_queues[sid], jpeg):
                             st["drops"] += 1
+                    t6 = time.perf_counter()
+                    st["t_ann_push"] += t6 - t5
 
                     window_elapsed = now - st["window_start"]
                     if window_elapsed >= 5.0:
+                        n = max(1, st["count"])
                         fps = st["count"] / window_elapsed
                         try:
                             qdepth = frame_queues[sid].qsize()
                         except Exception:
                             qdepth = -1  # qsize() unsupported on some platforms
+                        try:
+                            raw_qdepth = raw_frame_queues[sid].qsize()
+                        except Exception:
+                            raw_qdepth = -1
                         ts = _probe_frame_timestamp(fr)
                         age_str = f"{now - ts:.1f}s" if ts is not None else "n/a"
+                        avg_ms = {k: (v / n) * 1000 for k, v in st.items() if k.startswith("t_")}
+                        total_ms = sum(avg_ms.values())
                         logger.debug(
-                            "[%s] DIAG src=%d arrival_fps=%.1f drops_last_window=%d qdepth=%s frame_age=%s",
-                            run_id, sid, fps, st["drops"], qdepth, age_str,
+                            "[%s] DIAG src=%d arrival_fps=%.1f drops=%d raw_drops=%d "
+                            "qdepth=%s raw_qdepth=%s frame_age=%s avg_ms/frame: "
+                            "asarray=%.2f raw_encode=%.2f raw_push=%.2f overlay=%.2f "
+                            "ann_encode=%.2f ann_push=%.2f TOTAL=%.2f",
+                            run_id, sid, fps, st["drops"], st["raw_drops"],
+                            qdepth, raw_qdepth, age_str,
+                            avg_ms["t_asarray"], avg_ms["t_raw_encode"], avg_ms["t_raw_push"],
+                            avg_ms["t_overlay"], avg_ms["t_ann_encode"], avg_ms["t_ann_push"],
+                            total_ms,
                         )
                         st["window_start"] = now
                         st["count"] = 0
                         st["drops"] = 0
+                        st["raw_drops"] = 0
+                        for k in list(st.keys()):
+                            if k.startswith("t_"):
+                                st[k] = 0.0
 
                     total_frames += 1
                     if total_frames % 200 == 0:
@@ -741,7 +799,17 @@ def start_session(run_id: str, source_type: str, sources, network_yaml: str,
     initial_up = _probe_sources(sources)
     if not any(initial_up):
         initial_up = [True] * len(sources)
-    source_status = Array('b', [1 if ok else 0 for ok in initial_up])
+    # lock=False: we only need independent single-byte flag reads/writes per
+    # index (atomic on any real hardware), not cross-element transactions, so
+    # there's no need for the default internal semaphore-based lock. That
+    # lock becomes a liability here: if a worker process is ever killed
+    # (SIGKILL, which can't be caught) while mid-write to this array, a
+    # semaphore-based lock isn't released by the kernel on process death the
+    # way e.g. an flock is — it can stay stuck forever, hanging or crashing
+    # every future read of THIS session's source_status (get_status(),
+    # polled every ~3s by /stream/status while a stream is live, and by
+    # _cleanup_inference_slots() on every Stop).
+    source_status = Array('b', [1 if ok else 0 for ok in initial_up], lock=False)
     for i, ok in enumerate(initial_up):
         if not ok:
             logger.warning("[%s] source %d unreachable at start — excluding: %s", run_id, i, sources[i])
@@ -941,8 +1009,18 @@ def stop_session(run_id: str) -> bool:
 
 
 def get_status() -> list:
-    return [
-        {
+    result = []
+    for rid, s in SESSIONS.items():
+        try:
+            source_status = list(s["source_status"])
+        except Exception as e:
+            # Never let one session's reachability array take down status
+            # reporting for every session (or the whole endpoint) — this is
+            # polled every ~3s by the frontend while a stream is live, AND is
+            # how the backend discovers what to stop on every Stop click.
+            logger.warning("[%s] failed to read source_status: %s", rid, e)
+            source_status = None
+        result.append({
             "run_id":        rid,
             "base_slot":     s["base_slot"],
             "slots":         [w.slot_id for w in s["writers"]],
@@ -953,12 +1031,12 @@ def get_status() -> list:
             "sources":       s["sources"],
             # 1 = currently included in the live wginference.init() call,
             # 0 = excluded (unreachable at last probe, being retried in the
-            # background) — index-aligned to `sources`.
-            "source_status": list(s["source_status"]),
+            # background) — index-aligned to `sources`. None if it couldn't
+            # be read (see above).
+            "source_status": source_status,
             "network":       s["network"],
-        }
-        for rid, s in SESSIONS.items()
-    ]
+        })
+    return result
 
 
 def shutdown_handler(sig=None, frame=None):

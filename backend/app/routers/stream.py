@@ -290,25 +290,50 @@ async def _cleanup_inference_slots() -> None:
     
     This ensures a clean state when switching input types or stopping streams.
     """
-    # Any previously active multi-camera session is being torn down here
-    # (either replaced by a new stream or explicitly stopped) — clear it so
-    # /stream/status stops reporting a dead session.
+    # Capture the tracked multi-camera run_id BEFORE clearing state below.
+    # Stopping it directly (we already know its run_id) does NOT depend on
+    # GET /inference/status succeeding, unlike the enumerate-then-stop loop
+    # further down. That independence matters: if /inference/status ever
+    # fails or 500s (e.g. get_status() choking on a session's reachability
+    # array), the enumerate loop would silently find zero sessions and never
+    # call /inference/stop at all — Stop Stream would do nothing, with no
+    # error surfaced anywhere, which is exactly the bug this fixes.
+    tracked_run_id = (
+        _multi_camera_session.get("run_id")
+        if _multi_camera_session.get("active") else None
+    )
+
     _clear_multi_camera_session()
 
-    # Stop all voyager inference sessions. stop_session() on the voyager side
-    # now waits for a graceful stop_event-driven exit (up to ~6s) before
-    # falling back to a forced kill, specifically so the SDK's own cleanup
-    # releases the AIPU device cleanly — worst case that's ~12-13s per
-    # session. A short timeout here would abandon the request client-side
-    # while voyager keeps tearing down anyway, silently swallowed by the
-    # broad except below, which previously masked exactly this kind of
-    # timeout instead of surfacing it.
+    stopped_run_ids: set = set()
+
+    if tracked_run_id:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    f"{VOYAGER_BASE}/inference/stop",
+                    json={"run_id": tracked_run_id},
+                )
+            if resp.status_code == 200:
+                logger.info("Stopped tracked multi-camera session %s", tracked_run_id)
+                stopped_run_ids.add(tracked_run_id)
+            elif resp.status_code != 404:  # 404 just means it was already gone
+                logger.warning("Stop request for %s returned %d: %s",
+                               tracked_run_id, resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.warning("Could not stop tracked multi-camera session %s: %s", tracked_run_id, e)
+
+    # Enumerate + stop anything else still running — covers the multi-model/
+    # single-camera flow (which can have several concurrent run_ids) and
+    # acts as a safety net for any session this backend instance doesn't
+    # have local state for (e.g. after a backend restart).
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(f"{VOYAGER_BASE}/inference/status")
             if resp.status_code == 200:
                 sessions = resp.json().get("sessions", [])
-                for s in sessions:
+                remaining = [s for s in sessions if s.get("run_id") not in stopped_run_ids]
+                for s in remaining:
                     try:
                         await client.post(
                             f"{VOYAGER_BASE}/inference/stop",
@@ -317,10 +342,13 @@ async def _cleanup_inference_slots() -> None:
                         )
                     except Exception as e:
                         logger.warning("Could not stop voyager session %s: %s", s.get("run_id"), e)
-                if sessions:
-                    logger.info("Stopped %d voyager inference session(s)", len(sessions))
+                if remaining:
+                    logger.info("Stopped %d additional voyager inference session(s)", len(remaining))
+            else:
+                logger.warning("GET /inference/status returned %d — could not enumerate "
+                               "further sessions to stop", resp.status_code)
     except Exception as e:
-        logger.debug("Could not fetch voyager inference status: %s", e)
+        logger.warning("Could not fetch voyager inference status: %s", e)
 
     # Clear HLS directories for inference slots (2-5)
     import shutil
