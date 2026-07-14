@@ -142,11 +142,18 @@ const LiveViewPage = () => {
           : `Connected to ${sourceType}`,
       });
     } catch (err) {
+      console.error("[LiveView] Start Stream failed:", err);
       toast({ variant: "destructive", title: "Stream Error", description: err instanceof Error ? err.message : "Failed to start stream" });
     }
   };
 
   const handleStopStream = async () => {
+    // Diagnostic breadcrumb: if this never appears in the browser console on
+    // click, the click isn't reaching this handler at all (stale bundle,
+    // event not wired, or JS crashed earlier in the render) rather than the
+    // fetch failing — a materially different bug than anything inside this
+    // function, and this is the fastest way to tell them apart from DevTools.
+    console.warn("[LiveView] Stop Stream clicked — calling DELETE /api/stream/stop");
     try {
       const res = await fetch("/api/stream/stop", { method: "DELETE" });
       if (!res.ok) {
@@ -158,6 +165,7 @@ const LiveViewPage = () => {
       setRtspUrls([]);
       toast({ title: "Stream Stopped" });
     } catch (err) {
+      console.error("[LiveView] Stop Stream failed:", err);
       toast({ variant: "destructive", title: "Error", description: err instanceof Error ? err.message : "Failed to stop stream" });
     }
   };
@@ -333,6 +341,7 @@ const LiveViewPage = () => {
           </div>
 
           <button
+            type="button"
             onClick={handleStartStream}
             disabled={
               (activeSource === "RTSP" && rtspUrls.length === 0) ||
@@ -370,6 +379,7 @@ const LiveViewPage = () => {
                 : `${stream.sourceType} • ${activeSlots} slot${activeSlots !== 1 ? "s" : ""} active`}
             </div>
             <button
+              type="button"
               onClick={handleStopStream}
               className="rounded-lg bg-destructive px-3 py-1.5 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
             >
